@@ -723,7 +723,7 @@ def self_ping_loop():
         time.sleep(600)  # Every 10 minutes
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-def main():
+async def main():
     # Start keep-alive HTTP server in background thread (for Render)
     threading.Thread(target=run_ping_server, daemon=True).start()
     threading.Thread(target=self_ping_loop,  daemon=True).start()
@@ -770,7 +770,8 @@ def main():
     app.post_init = post_init
 
     logger.info("CIPHER Bot v3 starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
