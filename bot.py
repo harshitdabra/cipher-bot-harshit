@@ -770,7 +770,13 @@ async def main():
     app.post_init = post_init
 
     logger.info("CIPHER Bot v3 starting...")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await asyncio.Event().wait()  # Run forever
+        await app.updater.stop()
+        await app.stop()
 
 if __name__ == "__main__":
     import asyncio
