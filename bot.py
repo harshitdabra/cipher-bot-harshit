@@ -752,8 +752,11 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    async def post_init(application):
-        await application.bot.set_my_commands([
+    logger.info("CIPHER Bot v3 starting...")
+    async with app:
+        await app.initialize()
+        # Register commands menu in Telegram
+        await app.bot.set_my_commands([
             BotCommand("cipher",    "Full 30-min intelligence cycle"),
             BotCommand("btc",       "Deep BTC snapshot + analysis"),
             BotCommand("dominance", "BTC dominance + altcoin rotation"),
@@ -762,16 +765,12 @@ async def main():
             BotCommand("fear",      "Fear & Greed + sentiment data"),
             BotCommand("etf",       "ETF + institutional proxy data"),
             BotCommand("macro",     "Macro event calendar"),
-            BotCommand("watchlist", "Your tracked coins"),
+            BotCommand("watchlist",  "Your tracked coins"),
             BotCommand("ask",       "Ask anything with live data"),
             BotCommand("setup",     "Set custom instructions"),
             BotCommand("help",      "All commands"),
         ])
-    app.post_init = post_init
-
-    logger.info("CIPHER Bot v3 starting...")
-    async with app:
-        await app.initialize()
+        logger.info("Commands menu registered.")
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await asyncio.Event().wait()  # Run forever
