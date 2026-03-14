@@ -77,22 +77,55 @@ def is_authorized(update: Update) -> bool:
     return True  # Open registration — use plan gating for premium features
 
 # ── CIPHER System Prompt ──────────────────────────────────────────────────────
-CIPHER_SYSTEM = """You are CIPHER — crypto research intelligence system for professional analysts.
+CIPHER_SYSTEM = """You are CIPHER. You are a senior crypto on-chain analyst and derivatives strategist. You write like a professional trading desk, not a crypto influencer.
 
-You receive LIVE structured data fetched from CoinGecko Pro, DeFiLlama, and other on-chain sources.
-Your job: interpret what the numbers MEAN for price, risk, and opportunity — not describe them.
+You receive live structured market data. Your job is to extract what matters, state what it means, and give a clear action — nothing else.
 
-ANALYSIS RULES:
-- NEVER lead with lagging indicators (RSI, MACD, Bollinger Bands, MAs alone)
-- ALWAYS interpret: exchange flows, funding rates, OI, liquidation levels, stablecoin flows, ETF data
-- Require 2+ confirming signals before flagging a trade setup
-- Every trade setup MUST have an invalidation level — no invalidation = no trade
-- Conflicting signals = NEUTRAL + wait
-- End every report with clear next action: trade / monitor / flat / wait
+OUTPUT RULES — NON-NEGOTIABLE:
+1. NO emojis. Zero. Not a single one.
+2. NO filler phrases: never write "it is worth noting", "it is important to", "this suggests", "this indicates", "potentially", "may indicate", "could be", "one might", "in conclusion", "to summarize".
+3. NO AI-gen language: never write "delve", "landscape", "ecosystem", "robust", "seamless", "bullish outlook", "bearish sentiment", "market participants", "it remains to be seen".
+4. NO vague speculation: if data does not support a claim, do not make it.
+5. NO describing what data looks like. Only interpret what it means.
+6. NO hedging without reason. If signals are clear, state the bias clearly.
+7. NEVER call anything a "pump and dump" without specific on-chain evidence (wallet concentration, sudden volume spike with no news).
+8. NEVER say "strong fundamentals" — that is meaningless. Cite specific metrics: TVL, revenue, active addresses, fee generation.
 
-TONE: Senior analyst — direct, specific, no hype, no filler words.
-Use plain text. Telegram renders better without markdown headers.
-Use emoji section markers (📊 🔗 📈 🧠 📐 ⚡ 🎯) for structure."""
+STRUCTURE — use plain section headers, no symbols:
+
+MARKET STRUCTURE
+State price context, key levels, trend direction. Reference specific numbers. Note whether current price is at support/resistance, near ATH, or in no-man's land.
+
+ON-CHAIN CONTEXT
+Interpret exchange flow direction, stablecoin supply change, whale activity. Each point must reference the actual number and state what it means for near-term price.
+
+DERIVATIVES SNAPSHOT
+Funding rate direction and whether it is elevated or neutral. OI trend — expanding or contracting. What the derivatives structure implies about positioning risk.
+
+NARRATIVE ANALYSIS
+What is actually moving. Separate organic volume from search/social-driven noise. Identify which narratives have capital behind them vs which are retail-driven with no follow-through.
+
+SIGNAL SYNTHESIS
+One paragraph. State the overall bias (bullish / bearish / neutral), confidence level (high / medium / low), primary driver, and what would invalidate it. No bullet points here.
+
+TRADE SETUP (only if 2+ signals confirm)
+Asset:
+Direction:
+Entry zone:
+Invalidation: (hard stop — required)
+Target 1:
+Target 2:
+Conviction: high / medium / low
+Thesis: (2 sentences max, specific)
+
+ACTION
+One line. trade / monitor / flat / wait — and why.
+
+TONE RULES:
+- Write like a Bloomberg analyst, not a crypto Twitter account.
+- Short sentences. Active voice. Specific numbers always.
+- If data is unavailable or insufficient, say "insufficient data" — do not speculate to fill space.
+- If signals conflict, say so and call neutral. Do not force a bias."""
 
 # ── HTTP Helpers ──────────────────────────────────────────────────────────────
 async def fetch(url: str, headers: dict = {}, params: dict = {}) -> dict | list | None:
@@ -455,11 +488,13 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         f"{market}\n\n{fear}\n\n{trending}\n\n"
         f"DeFi Summary:\n{defi[:1000]}...\n\n"
-        "Produce a full CIPHER intelligence cycle report. "
-        "Interpret what ALL this data means for BTC and the broader market right now. "
-        "Include: on-chain signal assessment, derivatives context, macro bias, "
-        "narrative analysis from trending data, and a trade setup if signals support one. "
-        "Be specific. Flag any notable divergences or extremes."
+        "Run a full CIPHER cycle report using this data. "
+        "For each section: state the specific number, then state what it means — one implies the other, do not separate them. "
+        "Do not describe the data. Do not use vague language. "
+        "Stablecoin supply direction tells you whether capital is entering or leaving. State it explicitly. "
+        "Trending data tells you what retail is chasing — separate that from where real volume is. "
+        "If a trade setup exists, include it with a hard invalidation level. If not, say flat and why. "
+        "End with one line: the single most important thing to watch in the next 4 hours."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""), max_tokens=2000)
     await send_long(update, result)
@@ -470,9 +505,12 @@ async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btc_data = await data_btc_full()
     prompt = (
         f"{btc_data}\n\n"
-        "Analyze this BTC data. Cover: price structure, volume quality, "
-        "distance from ATH and what that implies, community sentiment signal. "
-        "Give a concrete bias with reasoning. End with: BULLISH / BEARISH / NEUTRAL + one main reason."
+        "BTC snapshot analysis. "
+        "State: where price sits relative to ATH and what that distance historically means for drawdown risk. "
+        "Vol/MCap ratio — is volume elevated or suppressed relative to market cap? What does that imply? "
+        "30d vs 7d vs 24h momentum — is the trend accelerating or decelerating? "
+        "Community data is a contrarian signal — interpret it as such. "
+        "Give bias with one specific reason. No vague language."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -483,11 +521,11 @@ async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dom_data = await data_dominance()
     prompt = (
         f"{dom_data}\n\n"
-        "Analyze BTC dominance and altcoin rotation. "
-        "Is capital rotating into alts or consolidating in BTC? "
-        "Which sectors or assets show relative strength? "
-        "What does current dominance level historically imply for altcoin season probability? "
-        "Give a clear rotation thesis."
+        "Dominance analysis. "
+        "State BTC dom exact level. At this level historically: does capital flow to alts or stay in BTC? "
+        "Look at ETH dom separately — ETH dom rising with BTC dom falling = early alt rotation. ETH dom flat = BTC-only move. "
+        "Which specific assets in the top 10 are outperforming BTC on 7d? List them with exact numbers. "
+        "State rotation thesis in one sentence with a specific trigger level to watch."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -498,11 +536,12 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trend_data = await data_trending()
     prompt = (
         f"{trend_data}\n\n"
-        "Analyze this trending and momentum data. "
-        "What narratives are building? Are these organic moves or late retail? "
-        "Which trending coins have strong vs weak fundamentals to back the move? "
-        "Flag any shill patterns or pump indicators. "
-        "Give a narrative intelligence summary — what story is the market telling right now?"
+        "Trending analysis. "
+        "For each trending coin: state its rank, 24h volume, and whether volume/mcap ratio is abnormal. "
+        "Separate two categories: (1) coins where volume preceded price — organic. (2) coins where search score spiked with price — retail chase. "
+        "For top gainers: is the move backed by volume expansion or thin order books? "
+        "Name the dominant narrative in one sentence. State whether it has capital behind it or is search-driven noise. "
+        "Flag any coin with >50% 24h gain and <$50M mcap — these are high manipulation probability."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -514,11 +553,11 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     defi_data = await data_defi()
     prompt = (
         f"{defi_data}\n\n"
-        "Analyze DeFi TVL data. "
-        "Which protocols are gaining or losing TVL significantly? "
-        "Which chains are dominant and is that shifting? "
-        "What does TVL trend imply for the health of DeFi and ETH ecosystem? "
-        "Flag any unusual TVL movements that warrant attention."
+        "DeFi TVL analysis. "
+        "State total TVL and its direction. Flat or declining TVL with rising token prices = price/TVL divergence, bearish signal. "
+        "For each top protocol: state TVL, 1d and 7d change. Any protocol losing >5% TVL in 7d is worth flagging — capital is leaving. "
+        "Chain dominance: which chain is gaining share? ETH losing TVL to Solana/Base matters for ETH price thesis. "
+        "Name one protocol with unusual TVL movement and state what is driving it specifically."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -529,12 +568,11 @@ async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fear_data = await data_fear_greed()
     prompt = (
         f"{fear_data}\n\n"
-        "Analyze this sentiment data. "
-        "NOTE: Fear & Greed is a lagging/confirming indicator — use it to gauge crowding, not as entry signal. "
-        "What does current sentiment imply about positioning? "
-        "Is stablecoin supply growing (dry powder building) or shrinking (capital deployed)? "
-        "Cross-reference sentiment with dominance data — does it confirm or diverge? "
-        "What does this mean for near-term risk/reward?"
+        "Sentiment analysis. "
+        "Fear & Greed score — state the number and its 3-day trend direction. Extreme greed (>80) at local tops historically precedes corrections. Extreme fear (<20) precedes rebounds. State which zone we are in. "
+        "Stablecoin market cap total — growing means dry powder accumulating, capital on sidelines. Shrinking means capital deployed into risk assets. State the direction explicitly. "
+        "Stablecoin volume spike relative to mcap signals imminent large movement — flag if present. "
+        "State the positioning implication in one sentence: are traders over-positioned long or is there room to run?"
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -545,11 +583,11 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     etf_data = await data_etf()
     prompt = (
         f"{etf_data}\n\n"
-        "Analyze institutional and ETF proxy signals. "
-        "What does the Vol/MCap ratio imply about institutional activity? "
-        "Is BTC behaving like an institutional asset right now or retail-driven? "
-        "What does distance from ATH imply for ETF buyer entry points? "
-        "Give context on what institutional flows typically look like at this price level."
+        "Institutional proxy analysis. "
+        "Vol/MCap ratio above 0.05 indicates high turnover — institutional desks active. Below 0.02 = accumulation phase or disinterest. State which. "
+        "ATH distance: ETF buyers who entered at launch have specific underwater levels. State the approximate average ETF entry price based on ATH date and current price. "
+        "Circulating supply vs max supply: BTC at 94%+ mined means supply shock from miners is structural, not cyclical. "
+        "Give one-line institutional thesis: are conditions favorable for ETF inflows right now based on price action and volatility?"
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -562,10 +600,11 @@ async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         f"{macro_data}\n\n"
         f"Current market context:\n{market_data[:500]}\n\n"
-        "Give a macro intelligence briefing. "
-        "What events are coming up that could move crypto markets? "
-        "How should a crypto trader position around these events? "
-        "What is the current macro regime (risk-on / risk-off / transitional) and why?"
+        "Macro briefing. "
+        "List upcoming high-impact events with dates. For each: state the expected crypto impact direction and the specific risk (e.g. hot CPI = rate hike fears = risk-off = BTC down). "
+        "Current macro regime: state whether rates, dollar strength, and equity correlation are net positive or negative for crypto right now. Use specific numbers where available. "
+        "Pre-event positioning: what does a trader do in the 48h before a FOMC or CPI — reduce exposure, hedge with options, or hold? Give a specific recommendation. "
+        "One-line regime summary: risk-on / risk-off / transitional and the single data point that defines it."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
