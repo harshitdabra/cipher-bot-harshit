@@ -77,55 +77,199 @@ def is_authorized(update: Update) -> bool:
     return True  # Open registration — use plan gating for premium features
 
 # ── CIPHER System Prompt ──────────────────────────────────────────────────────
-CIPHER_SYSTEM = """You are CIPHER. You are a senior crypto on-chain analyst and derivatives strategist. You write like a professional trading desk, not a crypto influencer.
+CIPHER_SYSTEM = """IDENTITY
+You are CIPHER. Senior crypto on-chain analyst, derivatives strategist, and portfolio risk advisor. You are the research desk that institutional traders wish they had access to. You produce the same quality of output as a Delphi Digital report or a Nansen alpha brief — concise, data-anchored, and actionable.
 
-You receive live structured market data. Your job is to extract what matters, state what it means, and give a clear action — nothing else.
+CORE MISSION
+Every response must do exactly one of these three things:
+1. Tell the user what a market signal MEANS (not what it is)
+2. Tell the user what to DO (specific action with levels)
+3. Tell the user what to WATCH (specific trigger that changes the thesis)
 
-OUTPUT RULES — NON-NEGOTIABLE:
-1. NO emojis. Zero. Not a single one.
-2. NO filler phrases: never write "it is worth noting", "it is important to", "this suggests", "this indicates", "potentially", "may indicate", "could be", "one might", "in conclusion", "to summarize".
-3. NO AI-gen language: never write "delve", "landscape", "ecosystem", "robust", "seamless", "bullish outlook", "bearish sentiment", "market participants", "it remains to be seen".
-4. NO vague speculation: if data does not support a claim, do not make it.
-5. NO describing what data looks like. Only interpret what it means.
-6. NO hedging without reason. If signals are clear, state the bias clearly.
-7. NEVER call anything a "pump and dump" without specific on-chain evidence (wallet concentration, sudden volume spike with no news).
-8. NEVER say "strong fundamentals" — that is meaningless. Cite specific metrics: TVL, revenue, active addresses, fee generation.
+If your response does none of these three things, rewrite it.
 
-STRUCTURE — use plain section headers, no symbols:
+─────────────────────────────────────────
+ABSOLUTE OUTPUT RULES
+─────────────────────────────────────────
+BANNED WORDS AND PHRASES — never use these under any circumstance:
+"it is worth noting" | "it is important to" | "this suggests" | "this indicates" |
+"potentially" | "may indicate" | "could be" | "one might" | "in conclusion" |
+"to summarize" | "delve" | "landscape" | "ecosystem" | "robust" | "seamless" |
+"bullish outlook" | "bearish sentiment" | "market participants" | "it remains to be seen" |
+"strong fundamentals" | "weak fundamentals" | "overall" | "essentially" | "notably" |
+"importantly" | "interestingly" | "at the end of the day" | "in terms of" | "looking at"
+
+BANNED BEHAVIORS:
+- No emojis. Not one.
+- No describing what data looks like. Only state what it means.
+- No vague hedging. If you are uncertain, say "insufficient data" and stop.
+- No historical price guesses. Only use prices explicitly given in the data.
+- No calling something manipulation without on-chain wallet concentration evidence.
+- No "strong/weak fundamentals" — cite specific metrics: TVL, fees, active addresses, revenue.
+- No padding responses to seem thorough. Short and right beats long and vague.
+
+─────────────────────────────────────────
+INTENT CLASSIFICATION — READ THIS FIRST
+─────────────────────────────────────────
+Before writing any response, classify the user's request into one of these types:
+
+TYPE A — MARKET REPORT REQUEST
+Examples: /cipher, /btc, /fear, /defi, "what is the market doing", "run a cycle report"
+Response format: Full structured report with all sections.
+
+TYPE B — SPECIFIC COIN QUESTION
+Examples: "should I buy SEI", "is SOL a good entry", "what is LINK doing", "scale into ARB?"
+Response format: COIN BRIEF (see below). Do NOT run a full market report.
+
+TYPE C — POSITION / PORTFOLIO QUESTION
+Examples: "should I scale in", "should I add to my position", "DCA now or wait", "take profits?"
+Response format: POSITION BRIEF (see below). Requires knowing current price from data.
+
+TYPE D — CONCEPT / EDUCATIONAL QUESTION
+Examples: "what is CVD", "explain funding rates", "how do liquidation maps work"
+Response format: Direct 3-5 sentence explanation with a practical trading implication.
+
+TYPE E — ALERT / SCAN REQUEST
+Examples: "any alerts", "anything unusual", "check for signals"
+Response format: ALERT BRIEF (see below).
+
+─────────────────────────────────────────
+RESPONSE FORMATS BY TYPE
+─────────────────────────────────────────
+
+TYPE A — FULL MARKET REPORT:
 
 MARKET STRUCTURE
-State price context, key levels, trend direction. Reference specific numbers. Note whether current price is at support/resistance, near ATH, or in no-man's land.
+Current price and key context. Is price at support, resistance, ATH, or mid-range? What does the current range mean for direction?
 
 ON-CHAIN CONTEXT
-Interpret exchange flow direction, stablecoin supply change, whale activity. Each point must reference the actual number and state what it means for near-term price.
+Exchange flow direction and implication. Stablecoin supply trend and what it signals. Any notable whale or institutional activity from data provided.
 
 DERIVATIVES SNAPSHOT
-Funding rate direction and whether it is elevated or neutral. OI trend — expanding or contracting. What the derivatives structure implies about positioning risk.
+Funding rate: level and direction. OI: expanding or contracting. What the combined derivatives structure implies about crowding and squeeze risk.
 
-NARRATIVE ANALYSIS
-What is actually moving. Separate organic volume from search/social-driven noise. Identify which narratives have capital behind them vs which are retail-driven with no follow-through.
+NARRATIVE
+What is driving volume right now. Organic vs retail-chased moves. Which narrative has real capital behind it.
 
 SIGNAL SYNTHESIS
-One paragraph. State the overall bias (bullish / bearish / neutral), confidence level (high / medium / low), primary driver, and what would invalidate it. No bullet points here.
+Bias: BULLISH / BEARISH / NEUTRAL | Confidence: HIGH / MEDIUM / LOW
+Driver: [one specific reason]
+Invalidation: [specific price level or event that kills this thesis]
 
-TRADE SETUP (only if 2+ signals confirm)
-Asset:
-Direction:
-Entry zone:
-Invalidation: (hard stop — required)
-Target 1:
-Target 2:
-Conviction: high / medium / low
-Thesis: (2 sentences max, specific)
+TRADE SETUP [only if 2+ independent signals align]
+Asset | Direction | Entry | Stop | T1 | T2 | Conviction
+Thesis: [2 sentences, numbers only]
 
-ACTION
-One line. trade / monitor / flat / wait — and why.
+ACTION: [trade / add / reduce / flat / wait] — [one-line reason]
 
-TONE RULES:
-- Write like a Bloomberg analyst, not a crypto Twitter account.
-- Short sentences. Active voice. Specific numbers always.
-- If data is unavailable or insufficient, say "insufficient data" — do not speculate to fill space.
-- If signals conflict, say so and call neutral. Do not force a bias."""
+───
+
+TYPE B — COIN BRIEF [for specific coin questions]:
+
+[COIN NAME] BRIEF | [current price from data]
+
+PRICE STRUCTURE
+Where price sits vs recent range and ATH. Key level above and below.
+
+MOMENTUM
+24h and 7d performance vs BTC. Is it outperforming or underperforming the market?
+
+VOLUME QUALITY
+Is volume expanding or contracting with the move? High vol + price up = real. Low vol + price up = thin.
+
+ON-CHAIN PROXY
+MCap rank, Vol/MCap ratio. What the ratio implies about institutional vs retail interest.
+
+VERDICT
+One of: SCALE IN | WAIT FOR LEVEL | AVOID | REDUCE
+If SCALE IN or WAIT: give exact entry zone, stop, and one target.
+If AVOID: state specific reason (no volume, overextended, better alternatives).
+
+───
+
+TYPE C — POSITION BRIEF [for scaling/DCA/profit questions]:
+
+POSITION ASSESSMENT | [asset] at [current price]
+
+CURRENT STRUCTURE
+Where price is relative to key levels. Is this a high, mid, or low-risk entry zone?
+
+RISK CONTEXT
+If adding here: what is the realistic downside to next major support?
+If reducing here: what upside is being sacrificed?
+
+MARKET ALIGNMENT
+Does the broader market structure support adding risk right now?
+
+RECOMMENDATION
+SCALE IN NOW | SCALE IN AT [level] | HOLD | REDUCE [%] | EXIT
+Reasoning: [2 sentences max, specific levels]
+If scaling: suggest position sizing (e.g. add 25% here, 25% at support, keep 50% dry)
+
+───
+
+TYPE D — CONCEPT EXPLANATION:
+Direct answer in 3-5 sentences. End with: "Trading implication: [one sentence on how to use this]."
+
+───
+
+TYPE E — ALERT BRIEF:
+List only triggered conditions. Format each as:
+[LEVEL] | [ASSET] | [CONDITION] | [IMPLICATION]
+RED = act now | AMBER = watch | INFO = context only
+If nothing triggered: "No active alerts. Market within normal parameters."
+
+─────────────────────────────────────────
+ANALYSIS FRAMEWORK — SIGNAL HIERARCHY
+─────────────────────────────────────────
+Primary signals (use these to form bias):
+1. Exchange net flow — net inflow = sell pressure building, net outflow = accumulation
+2. Stablecoin supply direction — growing = dry powder, shrinking = deployed capital
+3. Funding rate + OI divergence — price up + OI up + high funding = crowded long, fade risk
+4. CVD (Cumulative Volume Delta) — sustained negative CVD with flat price = distribution
+5. Spot ETF flow direction — sustained outflows = institutional exit, inflows = conviction buy
+
+Confirming signals (use to raise/lower conviction):
+6. Vol/MCap ratio — >0.08 = high institutional activity, <0.02 = accumulation or disinterest
+7. BTC dominance trend — rising dom = alts bleeding, falling dom = rotation beginning
+8. Fear & Greed extremes — below 15 or above 85 are contrarian signals, not primary signals
+9. DeFi TVL direction — protocol-level TVL loss = capital leaving, not just price down
+
+Never use as primary signal:
+RSI | MACD | Bollinger Bands | Moving averages alone | Fear & Greed as standalone
+
+─────────────────────────────────────────
+DATA HANDLING RULES
+─────────────────────────────────────────
+- All numbers must be formatted: $1.23B not $1234000000, $45.6M not $45600000
+- Current prices come ONLY from live data provided. Never use training data prices.
+- If a coin is asked about but not in the provided data, state: "Live data not available for [coin]. Analysis based on known structure only — verify current price before acting."
+- If a signal is unavailable, write "data unavailable" for that point. Do not fabricate.
+- Derivatives data (funding rates, OI, liquidations) is not in CoinGecko. When asked, note: "Funding/OI data: check CoinGlass for live rates. Based on price structure alone: [interpretation]."
+
+─────────────────────────────────────────
+TONE AND STYLE
+─────────────────────────────────────────
+- Bloomberg terminal, not crypto Twitter.
+- Active voice. Short sentences. Every sentence must contain information.
+- Numbers anchor every claim. No claim without a number or a named source.
+- When data is thin, say less. Quality over completeness.
+- Never moralize about trades. If someone asks about a risky trade, assess it objectively.
+- Never encourage or discourage based on risk tolerance you don't know. Give levels, let the analyst decide."""
+
+# ── Number Formatter ─────────────────────────────────────────────────────────
+def fmt(n: float) -> str:
+    """Convert raw number to human-readable K/M/B string."""
+    if n is None:
+        return "N/A"
+    n = float(n)
+    if abs(n) >= 1_000_000_000:
+        return f"${n/1_000_000_000:.2f}B"
+    if abs(n) >= 1_000_000:
+        return f"${n/1_000_000:.2f}M"
+    if abs(n) >= 1_000:
+        return f"${n/1_000:.2f}K"
+    return f"${n:,.2f}"
 
 # ── HTTP Helpers ──────────────────────────────────────────────────────────────
 async def fetch(url: str, headers: dict = {}, params: dict = {}) -> dict | list | None:
@@ -161,9 +305,9 @@ async def data_market_snapshot(coin_ids: list = None) -> str:
             ch24h = c.get("price_change_percentage_24h") or 0
             ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
             lines.append(
-                f"{c['symbol'].upper():6} ${c['current_price']:>12,.4f} | "
+                f"{c['symbol'].upper():6} ${c['current_price']:>12,.2f} | "
                 f"1h:{ch1h:+6.2f}% 24h:{ch24h:+6.2f}% 7d:{ch7d:+6.2f}% | "
-                f"Vol: ${c['total_volume']:>14,.0f} | MCap: ${c['market_cap']:>16,.0f}"
+                f"Vol: {fmt(c['total_volume']):>10} | MCap: {fmt(c['market_cap']):>10}"
             )
     if global_data and "data" in global_data:
         g = global_data["data"]
@@ -228,12 +372,12 @@ async def data_trending() -> str:
         gainers = sorted(top_gainers, key=lambda x: x.get("price_change_percentage_24h") or 0, reverse=True)[:5]
         for c in gainers:
             ch24 = c.get("price_change_percentage_24h") or 0
-            lines.append(f"  {c['symbol'].upper():8} +{ch24:.2f}% | ${c['current_price']:,.4f} | MCap: ${c['market_cap']:,.0f}")
+            lines.append(f"  {c['symbol'].upper():8} +{ch24:.2f}% | ${c['current_price']:,.4f} | MCap: {fmt(c['market_cap']):>10}")
         lines.append("\nTop 24h Losers:")
         losers = sorted(top_gainers, key=lambda x: x.get("price_change_percentage_24h") or 0)[:5]
         for c in losers:
             ch24 = c.get("price_change_percentage_24h") or 0
-            lines.append(f"  {c['symbol'].upper():8} {ch24:.2f}% | ${c['current_price']:,.4f} | MCap: ${c['market_cap']:,.0f}")
+            lines.append(f"  {c['symbol'].upper():8} {ch24:.2f}% | ${c['current_price']:,.4f} | MCap: {fmt(c['market_cap']):>10}")
     return "\n".join(lines)
 
 async def data_defi() -> str:
@@ -244,7 +388,7 @@ async def data_defi() -> str:
     )
     lines = [f"DEFI TVL DATA (DeFiLlama) | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
     if tvl:
-        lines.append(f"Total DeFi TVL: ${float(tvl):,.0f}")
+        lines.append(f"Total DeFi TVL: {fmt(float(tvl))}") 
     if protocols:
         lines.append("\nTop 10 Protocols by TVL:")
         sorted_p = sorted(protocols, key=lambda x: x.get("tvl") or 0, reverse=True)[:10]
@@ -252,18 +396,18 @@ async def data_defi() -> str:
             ch1d = p.get("change_1d") or 0
             ch7d = p.get("change_7d") or 0
             lines.append(
-                f"  {p['name']:20} TVL: ${p.get('tvl',0):>14,.0f} | "
+                f"  {p['name']:20} TVL: {fmt(p.get('tvl',0)):>10} | "
                 f"1d:{ch1d:+6.2f}% | 7d:{ch7d:+6.2f}% | Chain: {p.get('chain','multi')}"
             )
     if chains:
         lines.append("\nTop 10 Chains by TVL:")
         sorted_c = sorted(chains, key=lambda x: x.get("tvlPrevDay") or x.get("tvl") or 0, reverse=True)[:10]
         for c in sorted_c:
-            lines.append(f"  {c.get('name','?'):15} TVL: ${c.get('tvl', c.get('tvlPrevDay',0)):>14,.0f}")
+            lines.append(f"  {c.get('name','?'):15} TVL: {fmt(c.get('tvl', c.get('tvlPrevDay',0))):>10}")
     return "\n".join(lines)
 
 async def data_fear_greed() -> str:
-    fg, global_data, stables = await asyncio.gather(
+    fg, global_data, stables, btc_now = await asyncio.gather(
         fetch(FEAR_GREED_URL),
         fetch_cg("/global"),
         fetch_cg("/coins/markets", {
@@ -271,24 +415,47 @@ async def data_fear_greed() -> str:
             "ids": "tether,usd-coin,dai,first-digital-usd",
             "order": "market_cap_desc",
         }),
+        fetch_cg("/coins/markets", {
+            "vs_currency": "usd",
+            "ids": "bitcoin,ethereum",
+            "price_change_percentage": "24h",
+        }),
     )
-    lines = [f"SENTIMENT DATA | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    lines = [f"SENTIMENT DATA | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+
+    # Current BTC/ETH price — anchors the model to reality
+    if btc_now:
+        lines.append("CURRENT PRICES (live):")
+        for c in btc_now:
+            ch24 = c.get("price_change_percentage_24h") or 0
+            lines.append(f"  {c['symbol'].upper()}: ${c['current_price']:,.2f} | 24h: {ch24:+.2f}%")
+        lines.append("")
+
     if fg and "data" in fg:
         lines.append("Fear & Greed Index (Alternative.me):")
         for entry in fg["data"][:3]:
             ts = datetime.fromtimestamp(int(entry["timestamp"]), tz=timezone.utc).strftime("%b %d")
             lines.append(f"  {ts}: {entry['value']:>3}/100 — {entry['value_classification']}")
+
     if global_data and "data" in global_data:
         g = global_data["data"]
-        lines.append(f"\nMarket MC 24h Change: {g.get('market_cap_change_percentage_24h_usd',0):+.2f}%")
-        lines.append(f"BTC Dominance: {g['market_cap_percentage'].get('btc',0):.2f}%")
+        total_mc = g.get("total_market_cap", {}).get("usd", 0)
+        mc_change = g.get("market_cap_change_percentage_24h_usd", 0)
+        btc_dom = g["market_cap_percentage"].get("btc", 0)
+        eth_dom = g["market_cap_percentage"].get("eth", 0)
+        lines.append(f"\nTotal Market Cap: {fmt(total_mc)} | 24h Change: {mc_change:+.2f}%")
+        lines.append(f"BTC Dominance: {btc_dom:.2f}% | ETH Dom: {eth_dom:.2f}%")
+
     if stables:
-        lines.append("\nStablecoin Market Caps (supply proxy):")
+        lines.append("\nStablecoin Supply (dry powder proxy):")
         total_stable = 0
         for s in stables:
-            lines.append(f"  {s['symbol'].upper():8} MCap: ${s['market_cap']:>16,.0f} | Vol 24h: ${s['total_volume']:>14,.0f}")
-            total_stable += s.get("market_cap", 0)
-        lines.append(f"  Total Stablecoin MCap: ${total_stable:,.0f}")
+            mc = s.get("market_cap", 0)
+            vol = s.get("total_volume", 0)
+            vol_ratio = (vol / mc * 100) if mc else 0
+            total_stable += mc
+            lines.append(f"  {s['symbol'].upper():6} MCap: {fmt(mc):>10} | Vol 24h: {fmt(vol):>10} | Vol/MCap: {vol_ratio:.1f}%")
+        lines.append(f"  TOTAL STABLECOIN SUPPLY: {fmt(total_stable)}")
     return "\n".join(lines)
 
 async def data_etf() -> str:
@@ -305,8 +472,8 @@ async def data_etf() -> str:
             md = data.get("market_data", {})
             lines.append(f"{name} Institutional Proxy:")
             lines.append(f"  Price:     ${md.get('current_price',{}).get('usd',0):,.2f}")
-            lines.append(f"  MCap:      ${md.get('market_cap',{}).get('usd',0):,.0f}")
-            lines.append(f"  Vol 24h:   ${md.get('total_volume',{}).get('usd',0):,.0f}")
+            lines.append(f"  MCap:      {fmt(md.get('market_cap',{}).get('usd',0))}")
+            lines.append(f"  Vol 24h:   {fmt(md.get('total_volume',{}).get('usd',0))}")
             lines.append(f"  ATH:       ${md.get('ath',{}).get('usd',0):,.0f} ({md.get('ath_change_percentage',{}).get('usd',0):.1f}% from ATH)")
             lines.append(f"  ATH Date:  {md.get('ath_date',{}).get('usd','?')[:10]}")
             lines.append(f"  Circulating Supply: {md.get('circulating_supply',0):,.0f}")
@@ -569,10 +736,13 @@ async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         f"{fear_data}\n\n"
         "Sentiment analysis. "
-        "Fear & Greed score — state the number and its 3-day trend direction. Extreme greed (>80) at local tops historically precedes corrections. Extreme fear (<20) precedes rebounds. State which zone we are in. "
-        "Stablecoin market cap total — growing means dry powder accumulating, capital on sidelines. Shrinking means capital deployed into risk assets. State the direction explicitly. "
-        "Stablecoin volume spike relative to mcap signals imminent large movement — flag if present. "
-        "State the positioning implication in one sentence: are traders over-positioned long or is there room to run?"
+        "IMPORTANT: Current BTC and ETH prices are provided in the data above under CURRENT PRICES. "
+        "Use ONLY those prices for any trade setup. Never use historical or estimated prices. "
+        "Fear & Greed score — state the number and 3-day trend. Score below 20 = extreme fear zone historically associated with local bottoms. State current zone. "
+        "Stablecoin total supply direction — use the TOTAL STABLECOIN SUPPLY figure. Growing = dry powder building. Shrinking = capital deployed. "
+        "Vol/MCap ratio above 15% on USDT = abnormal turnover, large move likely imminent. State the exact ratio and whether it is elevated. "
+        "Trade setup: if one is warranted, use the live BTC price from the data to set entry, stop, and targets — not estimated prices. "
+        "State positioning implication in one sentence with a specific number."
     )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
@@ -667,13 +837,44 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /ask [your question]\nExample: /ask Is SOL in a good buy zone right now?")
         return
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    market_data = await data_market_snapshot()
-    prompt = (
-        f"LIVE MARKET CONTEXT:\n{market_data}\n\n"
-        f"ANALYST QUESTION: {question}\n\n"
-        "Answer this question using the live data above + your analysis framework. "
-        "Be specific and data-driven. If the question requires data not in the snapshot, say so and give best interpretation from available data."
-    )
+    coin_id = extract_coin_from_message(question)
+    if coin_id:
+        coin_data_raw, market_data = await asyncio.gather(
+            fetch_cg("/coins/markets", {
+                "vs_currency": "usd",
+                "ids": f"{coin_id},bitcoin",
+                "price_change_percentage": "1h,24h,7d,30d",
+                "sparkline": "false",
+            }),
+            data_market_snapshot(),
+        )
+        coin_section = ""
+        if coin_data_raw:
+            for c in coin_data_raw:
+                if c["id"] == coin_id:
+                    ch24h = c.get("price_change_percentage_24h") or 0
+                    ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+                    ath_pct = c.get("ath_change_percentage") or 0
+                    vol_mcap = (c["total_volume"] / c["market_cap"] * 100) if c.get("market_cap") else 0
+                    coin_section = (
+                        f"LIVE DATA FOR {c['name'].upper()} ({c['symbol'].upper()}):\n"
+                        f"  Price: ${c['current_price']:,.4f} | 24h: {ch24h:+.2f}% | 7d: {ch7d:+.2f}%\n"
+                        f"  MCap: {fmt(c['market_cap'])} | Vol: {fmt(c['total_volume'])} | Vol/MCap: {vol_mcap:.1f}%\n"
+                        f"  vs ATH: {ath_pct:.1f}% | Rank: #{c.get('market_cap_rank','?')}\n"
+                    )
+        prompt = (
+            f"{coin_section}\n"
+            f"BROAD MARKET CONTEXT:\n{market_data}\n\n"
+            f"ANALYST QUESTION: {question}\n\n"
+            "Use the correct CIPHER response format for this question type. Use ONLY live prices from data above."
+        )
+    else:
+        market_data = await data_market_snapshot()
+        prompt = (
+            f"LIVE MARKET CONTEXT:\n{market_data}\n\n"
+            f"ANALYST QUESTION: {question}\n\n"
+            "Classify and respond with the correct CIPHER format. Use only live data provided."
+        )
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
 
@@ -709,16 +910,90 @@ async def cmd_setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("↩️ Cancelled. Instructions unchanged.")
     return ConversationHandler.END
 
+# ── Coin ID resolver ──────────────────────────────────────────────────────────
+COIN_ALIASES = {
+    "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "bnb": "binancecoin",
+    "xrp": "ripple", "ada": "cardano", "avax": "avalanche-2", "link": "chainlink",
+    "dot": "polkadot", "matic": "matic-network", "arb": "arbitrum", "op": "optimism",
+    "sei": "sei-network", "inj": "injective-protocol", "sui": "sui", "apt": "aptos",
+    "atom": "cosmos", "near": "near", "ftm": "fantom", "trx": "tron",
+    "doge": "dogecoin", "shib": "shiba-inu", "pepe": "pepe", "wif": "dogwifcoin",
+    "hype": "hyperliquid", "jup": "jupiter-exchange-solana", "ena": "ethena",
+    "ton": "the-open-network", "trump": "official-trump", "uni": "uniswap",
+    "aave": "aave", "crv": "curve-dao-token", "mkr": "maker", "ldo": "lido-dao",
+    "sandbox": "the-sandbox", "mana": "decentraland", "gala": "gala",
+    "fet": "fetch-ai", "rndr": "render-token", "ocean": "ocean-protocol",
+}
+
+def extract_coin_from_message(text: str) -> str | None:
+    """Try to detect a coin ticker or name in the user message."""
+    text_lower = text.lower()
+    # Check aliases first
+    for alias, cg_id in COIN_ALIASES.items():
+        if f" {alias} " in f" {text_lower} " or text_lower.startswith(alias + " ") or text_lower.endswith(" " + alias):
+            return cg_id
+    return None
+
 # ── Free-text handler ──────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = get_user(update.effective_user.id)
+    user_text = update.message.text.strip()
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    market_data = await data_market_snapshot()
-    prompt = (
-        f"LIVE MARKET CONTEXT:\n{market_data}\n\n"
-        f"USER MESSAGE: {update.message.text.strip()}\n\n"
-        "Respond as CIPHER — use live data above + analysis framework."
-    )
+
+    # Detect if user is asking about a specific coin
+    coin_id = extract_coin_from_message(user_text)
+
+    if coin_id:
+        # Fetch specific coin data + broad market context
+        coin_data_raw, market_data = await asyncio.gather(
+            fetch_cg("/coins/markets", {
+                "vs_currency": "usd",
+                "ids": f"{coin_id},bitcoin",
+                "price_change_percentage": "1h,24h,7d,30d",
+                "sparkline": "false",
+            }),
+            data_market_snapshot(),
+        )
+        coin_section = ""
+        if coin_data_raw:
+            for c in coin_data_raw:
+                if c["id"] == coin_id:
+                    ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
+                    ch24h = c.get("price_change_percentage_24h") or 0
+                    ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+                    ch30d = c.get("price_change_percentage_30d_in_currency") or 0
+                    ath_pct = c.get("ath_change_percentage") or 0
+                    vol_mcap = (c["total_volume"] / c["market_cap"] * 100) if c.get("market_cap") else 0
+                    coin_section = (
+                        f"LIVE DATA FOR {c['name'].upper()} ({c['symbol'].upper()}):\n"
+                        f"  Price:        ${c['current_price']:,.4f}\n"
+                        f"  1h:           {ch1h:+.2f}%\n"
+                        f"  24h:          {ch24h:+.2f}%\n"
+                        f"  7d:           {ch7d:+.2f}%\n"
+                        f"  30d:          {ch30d:+.2f}%\n"
+                        f"  vs ATH:       {ath_pct:.1f}%\n"
+                        f"  MCap:         {fmt(c['market_cap'])}\n"
+                        f"  Vol 24h:      {fmt(c['total_volume'])}\n"
+                        f"  Vol/MCap:     {vol_mcap:.1f}%\n"
+                        f"  MCap Rank:    #{c.get('market_cap_rank','?')}\n"
+                    )
+        prompt = (
+            f"{coin_section}\n"
+            f"BROAD MARKET CONTEXT:\n{market_data}\n\n"
+            f"USER QUESTION: {user_text}\n\n"
+            "Classify this as TYPE B (coin question) or TYPE C (position question) and respond with the correct format. "
+            "Use ONLY the live prices from the data above. Do not use any historical prices from training."
+        )
+    else:
+        # General question — use full market snapshot
+        market_data = await data_market_snapshot()
+        prompt = (
+            f"LIVE MARKET CONTEXT:\n{market_data}\n\n"
+            f"USER QUESTION: {user_text}\n\n"
+            "Classify this question by type (A/B/C/D/E) and respond with the correct CIPHER format. "
+            "Use only live data provided. Do not fabricate prices."
+        )
+
     result = await call_claude(prompt, user_data.get("custom_instructions",""))
     await send_long(update, result)
 
