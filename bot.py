@@ -37,7 +37,7 @@ GLASS_KEY       = os.getenv("COINGLASS_API_KEY", "")
 OWNER_ID        = int(os.getenv("ALLOWED_USER_ID", "1953473977"))
 
 CG_BASE         = "https://pro-api.coingecko.com/api/v3"
-GLASS_BASE      = "https://open-api.coinglass.com/public/v2"
+GLASS_BASE      = "https://open-api-v4.coinglass.com/api"
 LLAMA_BASE      = "https://api.llama.fi"
 FNG_URL         = "https://api.alternative.me/fng/?limit=3"
 
@@ -150,8 +150,8 @@ async def cg(endpoint: str, params: dict = None) -> dict | list | None:
     return await _fetch(f"{CG_BASE}{endpoint}", {"x-cg-pro-api-key": CG_KEY}, params or {})
 
 async def gl(endpoint: str, params: dict = None) -> dict | list | None:
-    """CoinGlass Pro API."""
-    return await _fetch(f"{GLASS_BASE}{endpoint}", {"coinglassSecret": GLASS_KEY}, params or {})
+    """CoinGlass API v4."""
+    return await _fetch(f"{GLASS_BASE}{endpoint}", {"CG-API-KEY": GLASS_KEY}, params or {})
 
 async def ll(endpoint: str) -> dict | list | None:
     """DeFiLlama — no auth needed."""
@@ -344,64 +344,56 @@ async def cg_top50() -> list | None:
         "sparkline": "false",
     })
 
-# ── CoinGlass data ─────────────────────────────────────────────────────────────
-# CoinGlass Pro v2 endpoint reference:
-# /funding_rates_symbol  -> funding per exchange
-# /open_interest         -> OI per exchange (WORKING - confirmed via live response)
-# /liquidation_chart     -> liquidation totals with time_type param
-# /global_long_short_account_ratio -> L/S ratio with time_type param
-# All use coinglassSecret header and ?symbol=BTC query param
+# ── CoinGlass data (API v4) ────────────────────────────────────────────────────
+# Base: https://open-api-v4.coinglass.com/api
+# Header: CG-API-KEY
+# Verified endpoints:
+# /futures/funding-rate/exchange-list      ?symbol=BTC
+# /futures/open-interest/exchange-list     ?symbol=BTC
+# /futures/liquidation/aggregated-history  ?symbol=BTC&time_type=1h&limit=1
+# /futures/global-long-short-account-ratio/history  ?symbol=BTC&time_type=1h&limit=1
+# /etf/bitcoin/flow-history                ?limit=7
 
 async def gl_funding(symbol: str = "BTC") -> dict | None:
-    """Funding rates per exchange. CoinGlass v2: /funding_rates_symbol"""
-    # Try primary endpoint, fall back to alternate naming
-    result = await gl("/funding_rates_symbol", {"symbol": symbol})
+    result = await gl("/futures/funding-rate/exchange-list", {"symbol": symbol})
     if result and result.get("data"):
-        logger.info(f"CoinGlass funding OK for {symbol}")
         return result
-    # Alternate endpoint name used in some CoinGlass API versions
-    result2 = await gl("/funding_rates", {"symbol": symbol})
-    if result2 and result2.get("data"):
-        logger.info(f"CoinGlass funding (alt) OK for {symbol}")
-        return result2
-    logger.warning(f"CoinGlass funding returned no data for {symbol}: {str(result)[:100]}")
+    logger.warning(f"Funding rate failed for {symbol}: {str(result)[:150]}")
     return None
 
 async def gl_oi(symbol: str = "BTC") -> dict | None:
-    """Open interest per exchange. CoinGlass v2: /open_interest"""
-    result = await gl("/open_interest", {"symbol": symbol})
+    result = await gl("/futures/open-interest/exchange-list", {"symbol": symbol})
     if result and result.get("data"):
         return result
-    logger.warning(f"CoinGlass OI returned no data for {symbol}")
+    logger.warning(f"OI failed for {symbol}: {str(result)[:150]}")
     return None
 
 async def gl_liquidations(symbol: str = "BTC") -> dict | None:
-    """Liquidation chart data. CoinGlass v2: /liquidation_chart"""
-    # time_type values: 1h, 4h, 12h, 24h
-    result = await gl("/liquidation_chart", {"symbol": symbol, "time_type": "1h"})
+    result = await gl("/futures/liquidation/aggregated-history", {
+        "symbol": symbol, "time_type": "1h", "limit": "1",
+    })
     if result and result.get("data"):
         return result
-    # Some versions use different param name
-    result2 = await gl("/liquidation_chart", {"symbol": symbol, "timeType": "1h"})
-    if result2 and result2.get("data"):
-        return result2
-    logger.warning(f"CoinGlass liquidation returned no data for {symbol}: {str(result)[:100]}")
+    logger.warning(f"Liquidation failed for {symbol}: {str(result)[:150]}")
     return None
 
 async def gl_longshort(symbol: str = "BTC") -> dict | None:
-    """Long/short account ratio. CoinGlass v2: /global_long_short_account_ratio"""
-    result = await gl("/global_long_short_account_ratio", {"symbol": symbol, "time_type": "1h"})
+    result = await gl("/futures/global-long-short-account-ratio/history", {
+        "symbol": symbol, "time_type": "1h", "limit": "1",
+    })
     if result and result.get("data"):
         return result
-    # Alternate param
-    result2 = await gl("/global_long_short_account_ratio", {"symbol": symbol, "timeType": "1h"})
-    if result2 and result2.get("data"):
-        return result2
-    logger.warning(f"CoinGlass L/S returned no data for {symbol}: {str(result)[:100]}")
+    logger.warning(f"Long/short failed for {symbol}: {str(result)[:150]}")
+    return None
+
+async def gl_etf_flows() -> dict | None:
+    result = await gl("/etf/bitcoin/flow-history", {"limit": "7"})
+    if result and result.get("data"):
+        return result
+    logger.warning(f"ETF flows failed: {str(result)[:150]}")
     return None
 
 async def gl_multi(symbol: str = "BTC") -> tuple:
-    """Fetch all CoinGlass data for a symbol in parallel."""
     return await asyncio.gather(
         gl_funding(symbol),
         gl_oi(symbol),
@@ -412,18 +404,18 @@ async def gl_multi(symbol: str = "BTC") -> tuple:
 async def gl_debug(symbol: str = "BTC") -> str:
     """Debug helper: probe CoinGlass endpoints and return status report."""
     endpoints = [
-        ("/funding_rates_symbol",            {"symbol": symbol}),
-        ("/funding_rates",                   {"symbol": symbol}),
-        ("/open_interest",                   {"symbol": symbol}),
-        ("/liquidation_chart",               {"symbol": symbol, "time_type": "1h"}),
-        ("/global_long_short_account_ratio", {"symbol": symbol, "time_type": "1h"}),
+        ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
+        ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
+        ("/futures/liquidation/aggregated-history",          {"symbol": symbol, "time_type": "1h", "limit": "1"}),
+        ("/futures/global-long-short-account-ratio/history", {"symbol": symbol, "time_type": "1h", "limit": "1"}),
+        ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
     ]
-    lines = [f"CoinGlass API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
-    lines.append(f"Base URL: {GLASS_BASE}")
-    lines.append(f"Key configured: {'YES' if GLASS_KEY else 'NO — set COINGLASS_API_KEY'}")
+    lines = [f"API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
+    lines.append(f"Base: {GLASS_BASE}")
+    lines.append(f"Key: {'SET' if GLASS_KEY else 'MISSING — set COINGLASS_API_KEY'}")
     lines.append("")
     for ep, params in endpoints:
-        result = await _fetch(f"{GLASS_BASE}{ep}", {"coinglassSecret": GLASS_KEY}, params)
+        result = await _fetch(f"{GLASS_BASE}{ep}", {"CG-API-KEY": GLASS_KEY}, params)
         if result is None:
             status = "FAIL (None — auth error or wrong path)"
         elif not isinstance(result, dict):
@@ -480,250 +472,102 @@ def format_coin_section(c: dict, btc_24h: float = 0) -> str:
     return "\n".join(lines)
 
 def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) -> str:
+    """
+    Format CoinGlass v4 API responses.
+    v4 funding:  data=[{exchange, fundingRate, nextFundingTime}]
+    v4 oi:       data=[{exchange, openInterest, openInterestAmount}]
+    v4 liq:      data=[{t, longLiquidationUsd, shortLiquidationUsd}]
+    v4 ls:       data=[{longRatio, shortRatio, time}]
+    """
     lines = [f"=== {symbol} DERIVATIVES ==="]
 
     # Funding rates
     if funding_data and funding_data.get("data"):
-        data = funding_data["data"]
+        items = funding_data["data"]
+        items = items if isinstance(items, list) else []
         lines.append("\nFunding Rates (per 8h):")
-        exchanges = data if isinstance(data, list) else data.get("uMarginList", [])
         total, count = 0, 0
-        for ex in (exchanges[:8] if exchanges else []):
-            name = ex.get("exchangeName", ex.get("exchange", "?"))
-            rate = ex.get("fundingRate", ex.get("rate", 0)) or 0
+        for ex in items[:10]:
+            name = ex.get("exchange", ex.get("exchangeName", "?"))
+            rate = ex.get("fundingRate", ex.get("rate", None))
+            if rate is None:
+                continue
             try:
-                rate = float(rate) * 100
-                total += rate
+                r = float(rate) * 100
+                total += r
                 count += 1
-                flag = " [EXTREME]" if abs(rate) > 0.1 else ""
-                lines.append(f"  {name:12} {rate:>+7.4f}%{flag}")
+                flag = "  [EXTREME]" if abs(r) > 0.1 else ("  [elevated]" if abs(r) > 0.05 else "")
+                lines.append(f"  {name:14} {r:>+8.4f}%{flag}")
             except (TypeError, ValueError):
                 pass
         if count:
             avg = total / count
-            interp = "CROWDED LONG — fade risk" if avg > 0.08 else (
-                      "CROWDED SHORT — squeeze risk" if avg < -0.03 else "NEUTRAL")
-            lines.append(f"  Average:     {avg:>+7.4f}%  → {interp}")
+            interp = ("CROWDED LONG — longs paying, fade risk" if avg > 0.08
+                      else "CROWDED SHORT — squeeze potential" if avg < -0.03
+                      else "NEUTRAL — balanced positioning")
+            lines.append(f"  Avg: {avg:>+8.4f}%  →  {interp}")
+        else:
+            lines.append("  No exchange data")
     else:
-        lines.append("\nFunding Rates: data unavailable")
+        lines.append("\nFunding Rates: unavailable")
 
     # Open Interest
     if oi_data and oi_data.get("data"):
-        data = oi_data["data"]
-        items = data if isinstance(data, list) else data.get("data", [])
-        total_oi = sum(float(x.get("openInterest", x.get("oi", 0)) or 0) for x in items)
+        items = oi_data["data"]
+        items = items if isinstance(items, list) else []
+        total_oi = sum(float(x.get("openInterest", 0) or 0) for x in items)
         lines.append(f"\nOpen Interest: {fmt(total_oi)}")
-        for x in (items[:5] if items else []):
-            ex = x.get("exchangeName", x.get("exchange", "?"))
-            oi = float(x.get("openInterest", x.get("oi", 0)) or 0)
-            lines.append(f"  {ex:12} OI: {fmt(oi)}")
+        for x in items[:6]:
+            ex  = x.get("exchange", x.get("exchangeName", "?"))
+            oi  = float(x.get("openInterest", 0) or 0)
+            share = (oi / total_oi * 100) if total_oi else 0
+            lines.append(f"  {ex:16} {fmt(oi):>12}  ({share:.1f}%)")
     else:
-        lines.append("\nOpen Interest: data unavailable")
+        lines.append("\nOpen Interest: unavailable")
 
     # Long/Short ratio
     if ls_data and ls_data.get("data"):
-        data = ls_data["data"]
-        items = data if isinstance(data, list) else []
+        items = ls_data["data"]
+        items = items if isinstance(items, list) else []
         if items:
-            latest = items[-1] if items else {}
-            ls_ratio = latest.get("longRatio", latest.get("longAccount", 0)) or 0
-            ss_ratio = latest.get("shortRatio", latest.get("shortAccount", 0)) or 0
+            latest = items[-1]
             try:
-                ls_ratio = float(ls_ratio) * 100
-                ss_ratio = float(ss_ratio) * 100
-                interp = ("Majority long — crowded, watch for squeeze down" if ls_ratio > 60
-                          else "Majority short — potential squeeze up" if ls_ratio < 40
+                lr = float(latest.get("longRatio", latest.get("longAccount", 0)) or 0)
+                sr = float(latest.get("shortRatio", latest.get("shortAccount", 0)) or 0)
+                if lr < 2:   # decimal format → convert to %
+                    lr *= 100
+                    sr *= 100
+                interp = ("Majority long — downside squeeze risk" if lr > 60
+                          else "Majority short — upside squeeze potential" if lr < 40
                           else "Balanced")
-                lines.append(f"\nLong/Short Ratio:  Long {ls_ratio:.1f}%  /  Short {ss_ratio:.1f}%")
-                lines.append(f"  Interpretation: {interp}")
+                lines.append(f"\nLong/Short:  Long {lr:.1f}% / Short {sr:.1f}%  →  {interp}")
             except (TypeError, ValueError):
-                lines.append("\nLong/Short Ratio: parsing error")
+                lines.append("\nLong/Short: parse error")
     else:
-        lines.append("\nLong/Short Ratio: data unavailable")
+        lines.append("\nLong/Short Ratio: unavailable")
 
     # Liquidations
     if liq_data and liq_data.get("data"):
-        data = liq_data["data"]
-        buy_liq  = data.get("buyLiquidationSum",  data.get("buy",  0)) or 0
-        sell_liq = data.get("sellLiquidationSum", data.get("sell", 0)) or 0
-        try:
-            buy_liq  = float(buy_liq)
-            sell_liq = float(sell_liq)
-            total    = buy_liq + sell_liq
-            lines.append(f"\nLiquidations (1h):  Total {fmt(total)}")
-            lines.append(f"  Longs liquidated:  {fmt(buy_liq)}")
-            lines.append(f"  Shorts liquidated: {fmt(sell_liq)}")
-            if total > 100_000_000:
-                lines.append(f"  [ALERT] >$100M liquidated — cascade risk")
-        except (TypeError, ValueError):
-            lines.append("\nLiquidations: parsing error")
+        items = liq_data["data"]
+        items = items if isinstance(items, list) else []
+        if items:
+            latest = items[-1]
+            try:
+                long_liq  = float(latest.get("longLiquidationUsd",  latest.get("buyLiquidationUsd",  latest.get("buy",  0))) or 0)
+                short_liq = float(latest.get("shortLiquidationUsd", latest.get("sellLiquidationUsd", latest.get("sell", 0))) or 0)
+                total_liq = long_liq + short_liq
+                lines.append(f"\nLiquidations (1h): {fmt(total_liq)}")
+                lines.append(f"  Longs:  {fmt(long_liq)}  |  Shorts: {fmt(short_liq)}")
+                if total_liq > 50_000_000:
+                    lines.append(f"  [ELEVATED] — watch for cascade")
+            except (TypeError, ValueError):
+                lines.append("\nLiquidations: parse error")
     else:
-        lines.append("\nLiquidations: data unavailable")
+        lines.append("\nLiquidations: unavailable")
 
     return "\n".join(lines)
 
-# ── Master System Prompt ──────────────────────────────────────────────────────
-SYSTEM = """IDENTITY
-You are CIPHER — senior crypto on-chain analyst and derivatives strategist.
-You write like a Delphi Digital research brief or a Nansen alpha report.
-Direct. Data-anchored. Actionable. Nothing else.
 
-MISSION
-Every response must accomplish exactly one or more of:
-1. State what a signal MEANS — not what it is
-2. State what to DO — specific action with levels
-3. State what to WATCH — trigger that changes the thesis
-
-If your response does none of these, it is wrong. Rewrite it.
-
-══════════════════════════════════════
-BANNED — NEVER WRITE THESE
-══════════════════════════════════════
-PHRASES: "it is worth noting" | "this suggests" | "this indicates" | "potentially" |
-"may indicate" | "could be" | "one might" | "in conclusion" | "to summarize" |
-"it is important" | "it remains to be seen" | "overall" | "essentially" |
-"notably" | "importantly" | "interestingly" | "looking at" | "in terms of" |
-"delve" | "landscape" | "ecosystem" | "robust" | "seamless" |
-"market participants" | "strong fundamentals" | "weak fundamentals" |
-"bullish outlook" | "bearish sentiment" | "at the end of the day"
-
-BEHAVIORS:
-- No emojis
-- No describing data. Only interpret it.
-- No training-data prices. ONLY use prices in the provided live data.
-- No fabricating signals. Missing data = write "data unavailable" and stop.
-- No padding. Every sentence must contain new information.
-- No moralising about trade risk.
-
-NUMBER FORMAT: Always K/M/B. Never raw integers.
-PRICE FORMAT: Use exact price from data — never estimate.
-
-══════════════════════════════════════
-INTENT CLASSIFICATION — DO THIS FIRST
-══════════════════════════════════════
-TYPE A — MARKET REPORT     /cipher /btc /fear /defi + general market questions
-TYPE B — COIN QUESTION     any ticker or coin name question
-TYPE C — POSITION QUESTION scale in / DCA / take profit / add / reduce
-TYPE D — CONCEPT           explain CVD / funding rates / liquidations / etc
-TYPE E — ALERT SCAN        any alerts / anything unusual / check signals
-TYPE F — COMPARISON        X vs Y / which is better
-TYPE G — PORTFOLIO         watchlist analysis / multi-coin review
-
-══════════════════════════════════════
-RESPONSE FORMATS
-══════════════════════════════════════
-
-TYPE A — MARKET REPORT:
-MARKET STRUCTURE
-[Price + key level above and below. Support / resistance / no-man's land. Exact numbers.]
-
-ON-CHAIN CONTEXT
-[Stablecoin supply trend + implication. Exchange flow proxy. Institutional activity signal.]
-
-DERIVATIVES
-[Funding rate average + bias. OI total + direction. Long/short ratio + crowding risk.
-Liquidation context from last hour. One sentence on overall derivatives positioning risk.]
-
-NARRATIVE
-[What has real volume behind it. What is retail chasing. Dominant sector or catalyst.]
-
-SIGNAL SYNTHESIS
-Bias: BULLISH / BEARISH / NEUTRAL | Confidence: HIGH / MEDIUM / LOW
-Driver: [one specific reason with a number]
-Invalidation: [specific price or event]
-
-TRADE SETUP [only if 2+ independent signals agree — skip entire section if not]
-Asset: | Direction: | Entry: | Stop: | T1: | T2: | Conviction: H/M/L
-Thesis: [2 sentences, numbers only]
-
-ACTION: [trade / add / reduce / flat / wait] — [one-line reason]
-───
-
-TYPE B — COIN BRIEF:
-[COIN] BRIEF | [live price]
-
-PRICE STRUCTURE
-[vs 24h range. vs ATH distance and implication. Key level above and below.]
-
-MOMENTUM
-[1h/24h/7d trend direction. Accelerating or decelerating. vs BTC relative performance.]
-
-VOLUME QUALITY
-[Vol/MCap ratio. Is volume expanding with price move or contracting? Real or thin move.]
-
-DERIVATIVES [if available]
-[Funding rate. OI direction. Long/short ratio. Squeeze risk up or down.]
-
-VERDICT: SCALE IN / WAIT FOR LEVEL $X / AVOID / REDUCE
-[If actionable: entry zone, stop, target with specific numbers]
-───
-
-TYPE C — POSITION BRIEF:
-POSITION ASSESSMENT | [asset] @ [live price]
-
-STRUCTURE
-[Price vs key levels. High / mid / low risk zone right now.]
-
-DOWNSIDE
-[Next major support and % drawdown from current price if wrong.]
-
-MARKET ALIGNMENT
-[Does macro + derivatives structure support adding risk? YES/NO + one reason.]
-
-RECOMMENDATION: SCALE IN NOW / SCALE IN AT $X / HOLD / REDUCE X% / EXIT
-Sizing: [e.g. 25% now, 25% at support, 50% dry powder]
-Stop: $[X] — hard invalidation
-───
-
-TYPE D — CONCEPT:
-[3-5 sentences. Direct answer.]
-Trading implication: [one sentence on practical application.]
-───
-
-TYPE E — ALERTS:
-[RED / AMBER / INFO] | [asset] | [condition] | [implication]
-No padding. Only triggered conditions. If nothing: "No active alerts."
-───
-
-TYPE F — COMPARISON:
-[A] vs [B] | [timeframe]
-Relative performance: [exact numbers]
-Momentum differential: [which is stronger and by how much]
-Volume quality: [which has better Vol/MCap conviction]
-Derivatives edge: [which has cleaner derivatives structure]
-Verdict: [one sentence — which has stronger setup and the single reason]
-───
-
-TYPE G — PORTFOLIO BRIEF:
-For each coin:
-[COIN]: [bias] | Key level: $X | Action: hold / add at $X / reduce
-Summary: [overall portfolio risk — 2 sentences max]
-───
-
-══════════════════════════════════════
-SIGNAL HIERARCHY
-══════════════════════════════════════
-PRIMARY (form bias):
-1. Funding rate direction and magnitude
-2. OI trend — expanding into price up = conviction, expanding into price down = leverage build
-3. Long/short ratio extremes — >65% long = crowded, <35% long = short squeeze setup
-4. Liquidation cascade — >$100M/hour = forced selling, not organic
-5. Stablecoin supply direction — growing = dry powder, shrinking = deployed
-
-CONFIRMING (adjust conviction):
-6. Vol/MCap ratio — >8% elevated, <2% disinterest
-7. BTC dominance trend — rising = alts bleeding
-8. Fear & Greed extremes — <15 or >85 = contrarian only
-9. DeFi TVL direction
-
-NEVER PRIMARY: RSI | MACD | Bollinger Bands | MAs standalone | Fear & Greed alone
-
-══════════════════════════════════════
-STYLE
-══════════════════════════════════════
-Bloomberg terminal analyst. Not crypto Twitter.
-Active voice. Short sentences. Every sentence = new information.
-No claim without a number. No padding. Concise beats comprehensive."""
 
 # ── Groq call ─────────────────────────────────────────────────────────────────
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
