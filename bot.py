@@ -1,10 +1,17 @@
 """
-CIPHER Telegram Bot — Production Release
-CoinGecko Pro + DeFiLlama + Alternative.me + Groq (Llama 3.3 70B)
-QA Pass: all edge cases, error paths, data formatting, prompt engineering
+CIPHER Telegram Bot — Definitive Release
+Data: CoinGecko Pro + CoinGlass Pro + DeFiLlama + Alternative.me
+AI:   Groq Llama 3.3 70B
+
+Architecture:
+- CoinGecko Pro   → price, volume, market cap, dominance, trending
+- CoinGlass Pro   → funding rates, open interest, liquidations, long/short ratio
+- DeFiLlama       → TVL by protocol and chain
+- Alternative.me  → Fear & Greed Index
+- Groq            → analysis, synthesis, trade setup generation
 """
 
-import os, json, logging, asyncio, httpx, re
+import os, json, logging, asyncio, httpx, re, time
 from pathlib import Path
 from datetime import datetime, timezone
 from groq import Groq
@@ -16,43 +23,51 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger("CIPHER")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-GROQ_KEY       = os.getenv("GROQ_API_KEY", "")
-CG_KEY         = os.getenv("COINGECKO_API_KEY", "")
-OWNER_ID       = int(os.getenv("ALLOWED_USER_ID", "1953473977"))
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GROQ_KEY        = os.getenv("GROQ_API_KEY", "")
+CG_KEY          = os.getenv("COINGECKO_API_KEY", "")
+CG_KEY          = os.getenv("COINGECKO_API_KEY", "")
+GLASS_KEY       = os.getenv("COINGLASS_API_KEY", "")
+OWNER_ID        = int(os.getenv("ALLOWED_USER_ID", "1953473977"))
 
-CG_BASE        = "https://pro-api.coingecko.com/api/v3"
-CG_HEADERS     = {"x-cg-pro-api-key": CG_KEY}
-LLAMA_BASE     = "https://api.llama.fi"
-FNG_URL        = "https://api.alternative.me/fng/?limit=3"
+CG_BASE         = "https://pro-api.coingecko.com/api/v3"
+GLASS_BASE      = "https://open-api.coinglass.com/public/v2"  # CoinGlass v2
+LLAMA_BASE      = "https://api.llama.fi"
+FNG_URL         = "https://api.alternative.me/fng/?limit=3"
 
-DB_FILE        = Path("cipher_db.json")
-WAITING_SETUP  = 1
+DB_FILE         = Path("cipher_db.json")
+WAITING_SETUP   = 1
 
-# ── In-memory DB cache (avoid file reads on every message) ───────────────────
-_db_cache: dict = {}
+# ── In-memory DB ──────────────────────────────────────────────────────────────
+_DB: dict = {}
 
 def load_db() -> dict:
-    global _db_cache
-    if _db_cache:
-        return _db_cache
+    global _DB
+    if _DB:
+        return _DB
     if DB_FILE.exists():
         try:
-            _db_cache = json.loads(DB_FILE.read_text())
-            return _db_cache
+            _DB = json.loads(DB_FILE.read_text())
+            return _DB
         except Exception:
             pass
-    _db_cache = {"users": {}}
-    return _db_cache
+    _DB = {"users": {}}
+    return _DB
 
 def save_db(db: dict):
-    global _db_cache
-    _db_cache = db
-    DB_FILE.write_text(json.dumps(db, indent=2))
+    global _DB
+    _DB = db
+    try:
+        DB_FILE.write_text(json.dumps(db, indent=2))
+    except Exception as e:
+        logger.error(f"DB write failed: {e}")
 
 def get_user(uid: int) -> dict:
     db = load_db()
@@ -63,6 +78,7 @@ def get_user(uid: int) -> dict:
             "watchlist": ["bitcoin", "ethereum"],
             "joined": datetime.now(timezone.utc).isoformat(),
             "plan": "owner" if uid == OWNER_ID else "free",
+            "query_count": 0,
         }
         save_db(db)
     return db["users"][key]
@@ -73,1211 +89,1559 @@ def save_user(uid: int, data: dict):
     save_db(db)
 
 def is_pro(uid: int) -> bool:
-    if uid == OWNER_ID:
-        return True
-    return get_user(uid).get("plan") in ("pro", "owner")
+    return uid == OWNER_ID or get_user(uid).get("plan") in ("pro", "owner")
 
-# ── Number formatter ──────────────────────────────────────────────────────────
-def fmt(n, prefix="$") -> str:
-    """Format large numbers to K/M/B. Handles None, str, int, float."""
+# ── Formatters ────────────────────────────────────────────────────────────────
+def fmt(n, dollar=True) -> str:
+    """Human-readable K/M/B with null safety."""
     try:
         n = float(n)
     except (TypeError, ValueError):
         return "N/A"
-    if abs(n) >= 1_000_000_000:
+    prefix = "$" if dollar else ""
+    abs_n = abs(n)
+    if abs_n >= 1_000_000_000:
         return f"{prefix}{n/1_000_000_000:.2f}B"
-    if abs(n) >= 1_000_000:
+    if abs_n >= 1_000_000:
         return f"{prefix}{n/1_000_000:.2f}M"
-    if abs(n) >= 1_000:
+    if abs_n >= 1_000:
         return f"{prefix}{n/1_000:.2f}K"
     return f"{prefix}{n:,.4f}"
 
-def fmtp(n) -> str:
-    """Format percentage safely."""
+def pct(n, show_plus=True) -> str:
     try:
-        return f"{float(n):+.2f}%"
+        n = float(n)
+        return f"{'+' if n > 0 and show_plus else ''}{n:.2f}%"
     except (TypeError, ValueError):
         return "N/A"
 
-# ── HTTP client (shared, with retries) ───────────────────────────────────────
-async def fetch(url: str, headers: dict = None, params: dict = None) -> dict | list | None:
-    h = headers or {}
-    p = params or {}
-    for attempt in range(2):  # 1 retry
+def price_str(n) -> str:
+    """Smart price: 2 decimals for >=1, 5 for <1."""
+    try:
+        n = float(n)
+        return f"${n:,.2f}" if n >= 1 else f"${n:,.5f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+# ── HTTP client with retry + rate limit handling ───────────────────────────────
+async def _fetch(url: str, headers: dict, params: dict) -> dict | list | None:
+    for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(url, headers=h, params=p)
+            async with httpx.AsyncClient(timeout=25) as client:
+                r = await client.get(url, headers=headers, params=params)
                 if r.status_code == 429:
-                    logger.warning(f"Rate limited: {url[:60]}")
-                    await asyncio.sleep(2)
+                    wait = 2 ** attempt
+                    logger.warning(f"Rate limited {url[:50]}, waiting {wait}s")
+                    await asyncio.sleep(wait)
                     continue
+                if r.status_code in (401, 403):
+                    logger.error(f"Auth failed {url[:50]}: {r.status_code}")
+                    return None
                 r.raise_for_status()
                 return r.json()
         except httpx.TimeoutException:
-            logger.warning(f"Timeout: {url[:60]}")
+            logger.warning(f"Timeout attempt {attempt+1}: {url[:50]}")
+            await asyncio.sleep(1)
         except Exception as e:
-            logger.warning(f"Fetch error [{url[:60]}]: {e}")
-        if attempt == 0:
+            logger.warning(f"Fetch error attempt {attempt+1} [{url[:50]}]: {e}")
             await asyncio.sleep(1)
     return None
 
 async def cg(endpoint: str, params: dict = None) -> dict | list | None:
-    return await fetch(f"{CG_BASE}{endpoint}", CG_HEADERS, params or {})
+    return await _fetch(f"{CG_BASE}{endpoint}", {"x-cg-pro-api-key": CG_KEY}, params or {})
 
-# ── CIPHER Master System Prompt ───────────────────────────────────────────────
-CIPHER_SYSTEM = """IDENTITY
-You are CIPHER — senior crypto on-chain analyst, derivatives strategist, and portfolio risk advisor.
-You produce the quality of a Delphi Digital brief or Nansen alpha report: concise, data-anchored, and immediately actionable.
+async def gl(endpoint: str, params: dict = None) -> dict | list | None:
+    """CoinGlass Pro API."""
+    return await _fetch(f"{GLASS_BASE}{endpoint}", {"coinglassSecret": GLASS_KEY}, params or {})
 
-CORE MISSION
-Every response must do one of these:
-1. State what a signal MEANS (not what it is)
-2. State what to DO (specific action with levels)
-3. State what to WATCH (specific trigger that changes the thesis)
-If your response does none of these three, rewrite it.
+async def ll(endpoint: str) -> dict | list | None:
+    """DeFiLlama — no auth needed."""
+    return await _fetch(f"{LLAMA_BASE}{endpoint}", {}, {})
 
-══════════════════════════════════════════
-ABSOLUTE OUTPUT RULES — ZERO EXCEPTIONS
-══════════════════════════════════════════
-BANNED PHRASES — never write these:
-it is worth noting | it is important to | this suggests | this indicates | potentially |
-may indicate | could be | one might | in conclusion | to summarize | delve | landscape |
-ecosystem | robust | seamless | bullish outlook | bearish sentiment | market participants |
-it remains to be seen | strong fundamentals | weak fundamentals | overall | essentially |
-notably | importantly | interestingly | at the end of the day | in terms of | looking at |
-this shows | we can see | it appears | seems to be | might be | could indicate
+# ── Coin resolution ───────────────────────────────────────────────────────────
+# Maps ticker/name → CoinGecko ID and CoinGlass symbol
+COINS = {
+    # symbol: (coingecko_id, coinglass_symbol)
+    "btc":        ("bitcoin",                   "BTC"),
+    "bitcoin":    ("bitcoin",                   "BTC"),
+    "eth":        ("ethereum",                  "ETH"),
+    "ethereum":   ("ethereum",                  "ETH"),
+    "sol":        ("solana",                    "SOL"),
+    "solana":     ("solana",                    "SOL"),
+    "bnb":        ("binancecoin",               "BNB"),
+    "xrp":        ("ripple",                    "XRP"),
+    "ripple":     ("ripple",                    "XRP"),
+    "ada":        ("cardano",                   "ADA"),
+    "cardano":    ("cardano",                   "ADA"),
+    "avax":       ("avalanche-2",               "AVAX"),
+    "avalanche":  ("avalanche-2",               "AVAX"),
+    "dot":        ("polkadot",                  "DOT"),
+    "polkadot":   ("polkadot",                  "DOT"),
+    "trx":        ("tron",                      "TRX"),
+    "tron":       ("tron",                      "TRX"),
+    "ton":        ("the-open-network",          "TON"),
+    "near":       ("near",                      "NEAR"),
+    "atom":       ("cosmos",                    "ATOM"),
+    "cosmos":     ("cosmos",                    "ATOM"),
+    "doge":       ("dogecoin",                  "DOGE"),
+    "dogecoin":   ("dogecoin",                  "DOGE"),
+    "link":       ("chainlink",                 "LINK"),
+    "chainlink":  ("chainlink",                 "LINK"),
+    "arb":        ("arbitrum",                  "ARB"),
+    "arbitrum":   ("arbitrum",                  "ARB"),
+    "op":         ("optimism",                  "OP"),
+    "optimism":   ("optimism",                  "OP"),
+    "matic":      ("matic-network",             "MATIC"),
+    "polygon":    ("matic-network",             "MATIC"),
+    "sui":        ("sui",                       "SUI"),
+    "apt":        ("aptos",                     "APT"),
+    "aptos":      ("aptos",                     "APT"),
+    "sei":        ("sei-network",               "SEI"),
+    "inj":        ("injective-protocol",        "INJ"),
+    "injective":  ("injective-protocol",        "INJ"),
+    "ftm":        ("fantom",                    "FTM"),
+    "fantom":     ("fantom",                    "FTM"),
+    "uni":        ("uniswap",                   "UNI"),
+    "uniswap":    ("uniswap",                   "UNI"),
+    "aave":       ("aave",                      "AAVE"),
+    "mkr":        ("maker",                     "MKR"),
+    "maker":      ("maker",                     "MKR"),
+    "ldo":        ("lido-dao",                  "LDO"),
+    "lido":       ("lido-dao",                  "LDO"),
+    "crv":        ("curve-dao-token",           "CRV"),
+    "curve":      ("curve-dao-token",           "CRV"),
+    "gmx":        ("gmx",                       "GMX"),
+    "jup":        ("jupiter-exchange-solana",   "JUP"),
+    "jupiter":    ("jupiter-exchange-solana",   "JUP"),
+    "tao":        ("bittensor",                 "TAO"),
+    "bittensor":  ("bittensor",                 "TAO"),
+    "fet":        ("fetch-ai",                  "FET"),
+    "rndr":       ("render-token",              "RENDER"),
+    "render":     ("render-token",              "RENDER"),
+    "wld":        ("worldcoin-wld",             "WLD"),
+    "worldcoin":  ("worldcoin-wld",             "WLD"),
+    "grt":        ("the-graph",                 "GRT"),
+    "shib":       ("shiba-inu",                 "SHIB"),
+    "pepe":       ("pepe",                      "PEPE"),
+    "wif":        ("dogwifcoin",                "WIF"),
+    "bonk":       ("bonk",                      "BONK"),
+    "hype":       ("hyperliquid",               "HYPE"),
+    "hyperliquid":("hyperliquid",               "HYPE"),
+    "ena":        ("ethena",                    "ENA"),
+    "ethena":     ("ethena",                    "ENA"),
+    "strk":       ("starknet",                  "STRK"),
+    "starknet":   ("starknet",                  "STRK"),
+    "zk":         ("zksync",                    "ZK"),
+    "imx":        ("immutable-x",               "IMX"),
+    "algo":       ("algorand",                  "ALGO"),
+    "icp":        ("internet-computer",         "ICP"),
+    "fil":        ("filecoin",                  "FIL"),
+    "kas":        ("kaspa",                     "KAS"),
+    "kaspa":      ("kaspa",                     "KAS"),
+    "stx":        ("blockstack",                "STX"),
+    "ondo":       ("ondo-finance",              "ONDO"),
+    "pendle":     ("pendle",                    "PENDLE"),
+    "dydx":       ("dydx",                      "DYDX"),
+    "trump":      ("official-trump",            "TRUMP"),
+    "hbar":       ("hedera-hashgraph",          "HBAR"),
+    "hedera":     ("hedera-hashgraph",          "HBAR"),
+    "floki":      ("floki",                     "FLOKI"),
+    "not":        ("notcoin",                   "NOT"),
+    "notcoin":    ("notcoin",                   "NOT"),
+    "w":          ("wormhole",                  "W"),
+    "wormhole":   ("wormhole",                  "W"),
+    "eigen":      ("eigenlayer",                "EIGEN"),
+    "pyth":       ("pyth-network",              "PYTH"),
+    "jto":        ("jito-governance-token",     "JTO"),
+    "blur":       ("blur",                      "BLUR"),
+    "arkm":       ("arkham",                    "ARKM"),
+}
 
-BANNED BEHAVIORS:
-- Zero emojis
-- Never describe data. Only interpret it.
-- Never use training-data prices. Use ONLY prices in the provided live data.
-- Never fabricate signals. If data is missing, write: "data unavailable"
-- Never call something manipulation without on-chain wallet evidence
-- Never say "strong/weak fundamentals" — cite TVL, fees, active addresses, revenue
-- Never pad responses. Short and right beats long and vague.
-- Derivatives data (funding rates, OI, liquidations) is NOT in CoinGecko. When asked: note "Check CoinGlass for live rates" then interpret price structure instead.
+SKIP = {
+    "the","is","a","an","i","my","about","what","think","buy","sell",
+    "good","bad","now","still","long","short","hold","add","into","this",
+    "that","and","or","for","with","how","why","when","where","scale",
+    "dca","do","you","me","it","not","be","at","in","on","of","to","up",
+    "down","just","can","will","should","would","could","get","see","go",
+    "give","tell","show","run","check","look","find","mean","need","want",
+    "think","feel","know","take","make","has","have","had","was","were",
+    "are","been","being","its","your","any","all","some","more","less",
+    "very","too","also","than","then","so","if","but","by","from","after",
+    "before","during","which","who","best","worst","high","low","price",
+    "market","crypto","coin","token","trade","analysis","signal","entry",
+    "exit","position","portfolio","chart","data","news","today","right",
+    "now","here","there","ok","yes","no","hi","hey","hello","help","go",
+}
 
-NUMBER FORMAT: Always use K/M/B. Never write raw numbers like 1234567890.
+async def resolve_coin(text: str) -> tuple[str, str] | None:
+    """
+    Returns (coingecko_id, coinglass_symbol) or None.
+    Priority: 1) alias map  2) CoinGecko search fallback
+    """
+    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
 
-══════════════════════════════════════════
-INTENT CLASSIFICATION — ALWAYS DO THIS FIRST
-══════════════════════════════════════════
-Before writing, classify the request:
+    # Pass 1: exact alias match
+    for word in words:
+        if word in COINS:
+            return COINS[word]
 
-TYPE A — MARKET REPORT: /cipher, /btc, /fear, /defi, "what is market doing", "run cycle"
-TYPE B — COIN QUESTION: "what about TAO", "is SEI good", "LINK analysis", any ticker question
-TYPE C — POSITION QUESTION: "should I scale in", "DCA now", "take profits", "add to position"
-TYPE D — CONCEPT QUESTION: "what is CVD", "explain funding rates", "how do liquidations work"
-TYPE E — ALERT/SCAN: "any alerts", "anything unusual", "check signals"
-TYPE F — COMPARISON: "BTC vs ETH", "SOL vs AVAX", "which is better right now"
-TYPE G — PORTFOLIO: "review my portfolio", "which of my coins", "rebalance"
+    # Pass 2: CoinGecko search for unrecognised words
+    candidates = [w for w in words if w not in SKIP and len(w) >= 2]
+    for candidate in candidates:
+        result = await cg("/search", {"query": candidate})
+        if not result or not result.get("coins"):
+            continue
+        top = result["coins"][0]
+        sym  = top.get("symbol", "").lower()
+        name = top.get("name", "").lower()
+        cg_id = top.get("id", "")
+        if sym == candidate or name == candidate or name.startswith(candidate):
+            gl_sym = top.get("symbol", "").upper()
+            # Also check our map for CoinGlass symbol
+            for k, (gid, gsym) in COINS.items():
+                if gid == cg_id:
+                    return (cg_id, gsym)
+            return (cg_id, gl_sym)
+    return None
 
-══════════════════════════════════════════
+# ── CoinGecko data ─────────────────────────────────────────────────────────────
+async def cg_coin(cg_id: str) -> dict | None:
+    """Full coin data from CoinGecko markets endpoint."""
+    result = await cg("/coins/markets", {
+        "vs_currency": "usd",
+        "ids": f"{cg_id},bitcoin",
+        "price_change_percentage": "1h,24h,7d,30d",
+        "sparkline": "false",
+    })
+    return result
+
+async def cg_global() -> dict | None:
+    return await cg("/global")
+
+async def cg_market(ids: str = None) -> list | None:
+    default_ids = (
+        "bitcoin,ethereum,solana,binancecoin,ripple,cardano,"
+        "avalanche-2,polkadot,tron,near,cosmos,chainlink,"
+        "arbitrum,optimism,sui,aptos,sei-network,injective-protocol"
+    )
+    return await cg("/coins/markets", {
+        "vs_currency": "usd",
+        "ids": ids or default_ids,
+        "order": "market_cap_desc",
+        "price_change_percentage": "1h,24h,7d",
+        "sparkline": "false",
+    })
+
+async def cg_trending() -> dict | None:
+    return await cg("/search/trending")
+
+async def cg_top50() -> list | None:
+    return await cg("/coins/markets", {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": "50",
+        "page": "1",
+        "price_change_percentage": "1h,24h,7d",
+        "sparkline": "false",
+    })
+
+# ── CoinGlass data ─────────────────────────────────────────────────────────────
+async def gl_funding(symbol: str = "BTC") -> dict | None:
+    """Funding rates across exchanges."""
+    return await gl("/funding_rates_symbol", {"symbol": symbol})
+
+async def gl_oi(symbol: str = "BTC") -> dict | None:
+    """Open interest by exchange."""
+    return await gl("/open_interest", {"symbol": symbol})
+
+async def gl_liquidations(symbol: str = "BTC", time_range: str = "1h") -> dict | None:
+    """Liquidation data."""
+    return await gl("/liquidation_chart", {"symbol": symbol, "time_type": time_range})
+
+async def gl_longshort(symbol: str = "BTC") -> dict | None:
+    """Long/short account ratio."""
+    return await gl("/global_long_short_account_ratio", {"symbol": symbol, "time_type": "1h"})
+
+async def gl_multi(symbol: str = "BTC") -> tuple:
+    """Fetch all CoinGlass data for a symbol in parallel."""
+    return await asyncio.gather(
+        gl_funding(symbol),
+        gl_oi(symbol),
+        gl_liquidations(symbol),
+        gl_longshort(symbol),
+    )
+
+# ── Data formatters ───────────────────────────────────────────────────────────
+def format_coin_section(c: dict, btc_24h: float = 0) -> str:
+    """Format a single coin's market data into analysis-ready text."""
+    ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
+    ch24h = c.get("price_change_percentage_24h") or 0
+    ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+    ch30d = c.get("price_change_percentage_30d_in_currency") or 0
+    ath_p = c.get("ath_change_percentage") or 0
+    mc    = c.get("market_cap") or 1
+    vol   = c.get("total_volume") or 0
+    vm    = (vol / mc * 100) if mc else 0
+    lo    = c.get("low_24h") or 0
+    hi    = c.get("high_24h") or 0
+    circ  = c.get("circulating_supply") or 0
+    maxs  = c.get("max_supply")
+    ath   = c.get("ath") or 0
+    p     = c.get("current_price") or 0
+    rel   = ch24h - btc_24h
+
+    lines = [
+        f"=== {c['name'].upper()} ({c['symbol'].upper()}) ===",
+        f"Price:       {price_str(p)}",
+        f"1h:          {pct(ch1h)}  |  24h: {pct(ch24h)}  |  7d: {pct(ch7d)}  |  30d: {pct(ch30d)}",
+        f"24h Range:   {price_str(lo)} — {price_str(hi)}",
+        f"vs ATH:      {ath_p:.1f}%  (ATH: {price_str(ath)})",
+        f"MCap:        {fmt(mc)}  |  Rank #{c.get('market_cap_rank','?')}",
+        f"Vol 24h:     {fmt(vol)}  |  Vol/MCap: {vm:.1f}%",
+    ]
+    if circ:
+        if maxs:
+            issued = circ / maxs * 100
+            lines.append(f"Supply:      {circ:,.0f} / {maxs:,.0f}  ({issued:.1f}% issued)")
+        else:
+            lines.append(f"Circulating: {circ:,.0f}")
+    if btc_24h:
+        lines.append(f"vs BTC 24h:  {rel:+.2f}pp  ({'OUTPERFORM' if rel > 0 else 'UNDERPERFORM'})")
+    return "\n".join(lines)
+
+def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) -> str:
+    lines = [f"=== {symbol} DERIVATIVES (CoinGlass) ==="]
+
+    # Funding rates
+    if funding_data and funding_data.get("data"):
+        data = funding_data["data"]
+        lines.append("\nFunding Rates (per 8h):")
+        exchanges = data if isinstance(data, list) else data.get("uMarginList", [])
+        total, count = 0, 0
+        for ex in (exchanges[:8] if exchanges else []):
+            name = ex.get("exchangeName", ex.get("exchange", "?"))
+            rate = ex.get("fundingRate", ex.get("rate", 0)) or 0
+            try:
+                rate = float(rate) * 100
+                total += rate
+                count += 1
+                flag = " [EXTREME]" if abs(rate) > 0.1 else ""
+                lines.append(f"  {name:12} {rate:>+7.4f}%{flag}")
+            except (TypeError, ValueError):
+                pass
+        if count:
+            avg = total / count
+            interp = "CROWDED LONG — fade risk" if avg > 0.08 else (
+                      "CROWDED SHORT — squeeze risk" if avg < -0.03 else "NEUTRAL")
+            lines.append(f"  Average:     {avg:>+7.4f}%  → {interp}")
+    else:
+        lines.append("\nFunding Rates: data unavailable — check CoinGlass directly")
+
+    # Open Interest
+    if oi_data and oi_data.get("data"):
+        data = oi_data["data"]
+        items = data if isinstance(data, list) else data.get("data", [])
+        total_oi = sum(float(x.get("openInterest", x.get("oi", 0)) or 0) for x in items)
+        lines.append(f"\nOpen Interest: {fmt(total_oi)}")
+        for x in (items[:5] if items else []):
+            ex = x.get("exchangeName", x.get("exchange", "?"))
+            oi = float(x.get("openInterest", x.get("oi", 0)) or 0)
+            lines.append(f"  {ex:12} OI: {fmt(oi)}")
+    else:
+        lines.append("\nOpen Interest: data unavailable")
+
+    # Long/Short ratio
+    if ls_data and ls_data.get("data"):
+        data = ls_data["data"]
+        items = data if isinstance(data, list) else []
+        if items:
+            latest = items[-1] if items else {}
+            ls_ratio = latest.get("longRatio", latest.get("longAccount", 0)) or 0
+            ss_ratio = latest.get("shortRatio", latest.get("shortAccount", 0)) or 0
+            try:
+                ls_ratio = float(ls_ratio) * 100
+                ss_ratio = float(ss_ratio) * 100
+                interp = ("Majority long — crowded, watch for squeeze down" if ls_ratio > 60
+                          else "Majority short — potential squeeze up" if ls_ratio < 40
+                          else "Balanced")
+                lines.append(f"\nLong/Short Ratio:  Long {ls_ratio:.1f}%  /  Short {ss_ratio:.1f}%")
+                lines.append(f"  Interpretation: {interp}")
+            except (TypeError, ValueError):
+                lines.append("\nLong/Short Ratio: parsing error")
+    else:
+        lines.append("\nLong/Short Ratio: data unavailable")
+
+    # Liquidations
+    if liq_data and liq_data.get("data"):
+        data = liq_data["data"]
+        buy_liq  = data.get("buyLiquidationSum",  data.get("buy",  0)) or 0
+        sell_liq = data.get("sellLiquidationSum", data.get("sell", 0)) or 0
+        try:
+            buy_liq  = float(buy_liq)
+            sell_liq = float(sell_liq)
+            total    = buy_liq + sell_liq
+            lines.append(f"\nLiquidations (1h):  Total {fmt(total)}")
+            lines.append(f"  Longs liquidated:  {fmt(buy_liq)}")
+            lines.append(f"  Shorts liquidated: {fmt(sell_liq)}")
+            if total > 100_000_000:
+                lines.append(f"  [ALERT] >$100M liquidated — cascade risk")
+        except (TypeError, ValueError):
+            lines.append("\nLiquidations: parsing error")
+    else:
+        lines.append("\nLiquidations: data unavailable")
+
+    return "\n".join(lines)
+
+# ── Master System Prompt ──────────────────────────────────────────────────────
+SYSTEM = """IDENTITY
+You are CIPHER — senior crypto on-chain analyst and derivatives strategist.
+You write like a Delphi Digital research brief or a Nansen alpha report.
+Direct. Data-anchored. Actionable. Nothing else.
+
+MISSION
+Every response must accomplish exactly one or more of:
+1. State what a signal MEANS — not what it is
+2. State what to DO — specific action with levels
+3. State what to WATCH — trigger that changes the thesis
+
+If your response does none of these, it is wrong. Rewrite it.
+
+══════════════════════════════════════
+BANNED — NEVER WRITE THESE
+══════════════════════════════════════
+PHRASES: "it is worth noting" | "this suggests" | "this indicates" | "potentially" |
+"may indicate" | "could be" | "one might" | "in conclusion" | "to summarize" |
+"it is important" | "it remains to be seen" | "overall" | "essentially" |
+"notably" | "importantly" | "interestingly" | "looking at" | "in terms of" |
+"delve" | "landscape" | "ecosystem" | "robust" | "seamless" |
+"market participants" | "strong fundamentals" | "weak fundamentals" |
+"bullish outlook" | "bearish sentiment" | "at the end of the day"
+
+BEHAVIORS:
+- No emojis
+- No describing data. Only interpret it.
+- No training-data prices. ONLY use prices in the provided live data.
+- No fabricating signals. Missing data = write "data unavailable" and stop.
+- No padding. Every sentence must contain new information.
+- No moralising about trade risk.
+
+NUMBER FORMAT: Always K/M/B. Never raw integers.
+PRICE FORMAT: Use exact price from data — never estimate.
+
+══════════════════════════════════════
+INTENT CLASSIFICATION — DO THIS FIRST
+══════════════════════════════════════
+TYPE A — MARKET REPORT     /cipher /btc /fear /defi + general market questions
+TYPE B — COIN QUESTION     any ticker or coin name question
+TYPE C — POSITION QUESTION scale in / DCA / take profit / add / reduce
+TYPE D — CONCEPT           explain CVD / funding rates / liquidations / etc
+TYPE E — ALERT SCAN        any alerts / anything unusual / check signals
+TYPE F — COMPARISON        X vs Y / which is better
+TYPE G — PORTFOLIO         watchlist analysis / multi-coin review
+
+══════════════════════════════════════
 RESPONSE FORMATS
-══════════════════════════════════════════
+══════════════════════════════════════
 
-TYPE A — FULL REPORT:
----
+TYPE A — MARKET REPORT:
 MARKET STRUCTURE
-[Price + context. Key level above and below. Is this support, resistance, or no-man's land?]
+[Price + key level above and below. Support / resistance / no-man's land. Exact numbers.]
 
 ON-CHAIN CONTEXT
-[Exchange flow direction + implication. Stablecoin supply trend + what it signals. Any notable entity activity.]
+[Stablecoin supply trend + implication. Exchange flow proxy. Institutional activity signal.]
 
-DERIVATIVES SNAPSHOT
-[Funding rate level + direction. OI expanding or contracting. Crowding risk assessment.]
+DERIVATIVES
+[Funding rate average + bias. OI total + direction. Long/short ratio + crowding risk.
+Liquidation context from last hour. One sentence on overall derivatives positioning risk.]
 
 NARRATIVE
-[What is driving real volume. Organic vs retail-chased. Which narrative has capital behind it.]
+[What has real volume behind it. What is retail chasing. Dominant sector or catalyst.]
 
 SIGNAL SYNTHESIS
 Bias: BULLISH / BEARISH / NEUTRAL | Confidence: HIGH / MEDIUM / LOW
 Driver: [one specific reason with a number]
 Invalidation: [specific price or event]
 
-TRADE SETUP [only if 2+ signals confirm — skip section entirely if not]
-Asset | Direction | Entry | Stop | T1 | T2 | Conviction: H/M/L
+TRADE SETUP [only if 2+ independent signals agree — skip entire section if not]
+Asset: | Direction: | Entry: | Stop: | T1: | T2: | Conviction: H/M/L
 Thesis: [2 sentences, numbers only]
 
 ACTION: [trade / add / reduce / flat / wait] — [one-line reason]
----
+───
 
 TYPE B — COIN BRIEF:
----
-[COIN] BRIEF | $[live price from data]
+[COIN] BRIEF | [live price]
 
 PRICE STRUCTURE
-[vs recent range, vs ATH, key level above and below]
+[vs 24h range. vs ATH distance and implication. Key level above and below.]
 
 MOMENTUM
-[24h and 7d vs BTC — outperforming or underperforming]
+[1h/24h/7d trend direction. Accelerating or decelerating. vs BTC relative performance.]
 
 VOLUME QUALITY
-[Vol/MCap ratio. Expanding or contracting with move. Thin or real.]
+[Vol/MCap ratio. Is volume expanding with price move or contracting? Real or thin move.]
 
-ON-CHAIN PROXY
-[MCap rank. Institutional vs retail interest signal from ratio.]
+DERIVATIVES [if available]
+[Funding rate. OI direction. Long/short ratio. Squeeze risk up or down.]
 
-VERDICT: SCALE IN / WAIT FOR LEVEL / AVOID / REDUCE
-[If SCALE IN or WAIT: entry zone, stop, target]
-[If AVOID: specific reason — overextended / no volume / better alternative]
----
+VERDICT: SCALE IN / WAIT FOR LEVEL $X / AVOID / REDUCE
+[If actionable: entry zone, stop, target with specific numbers]
+───
 
 TYPE C — POSITION BRIEF:
----
-POSITION ASSESSMENT | [asset] @ $[live price]
+POSITION ASSESSMENT | [asset] @ [live price]
 
 STRUCTURE
-[Where price is vs key levels. High / mid / low risk entry zone right now.]
+[Price vs key levels. High / mid / low risk zone right now.]
 
-DOWNSIDE RISK
-[Realistic next major support if wrong. % drawdown from current.]
+DOWNSIDE
+[Next major support and % drawdown from current price if wrong.]
 
 MARKET ALIGNMENT
-[Does broad market support adding risk here? Y/N + reason.]
+[Does macro + derivatives structure support adding risk? YES/NO + one reason.]
 
-RECOMMENDATION: SCALE IN NOW / SCALE IN AT $[X] / HOLD / REDUCE [%] / EXIT
-Sizing: [e.g. add 25% here, 25% at $X, hold 50% dry]
-Reason: [2 sentences, specific levels]
----
+RECOMMENDATION: SCALE IN NOW / SCALE IN AT $X / HOLD / REDUCE X% / EXIT
+Sizing: [e.g. 25% now, 25% at support, 50% dry powder]
+Stop: $[X] — hard invalidation
+───
 
 TYPE D — CONCEPT:
-[3-5 sentences, direct answer.]
-Trading implication: [one sentence on how to use this in practice.]
----
+[3-5 sentences. Direct answer.]
+Trading implication: [one sentence on practical application.]
+───
 
-TYPE E — ALERT BRIEF:
-[List only triggered conditions:]
+TYPE E — ALERTS:
 [RED / AMBER / INFO] | [asset] | [condition] | [implication]
-If nothing triggered: "No active alerts. Market within normal parameters."
----
+No padding. Only triggered conditions. If nothing: "No active alerts."
+───
 
 TYPE F — COMPARISON:
----
-[ASSET A] vs [ASSET B] | [timeframe]
+[A] vs [B] | [timeframe]
+Relative performance: [exact numbers]
+Momentum differential: [which is stronger and by how much]
+Volume quality: [which has better Vol/MCap conviction]
+Derivatives edge: [which has cleaner derivatives structure]
+Verdict: [one sentence — which has stronger setup and the single reason]
+───
 
-RELATIVE PERFORMANCE
-[Exact 24h and 7d numbers for each]
+TYPE G — PORTFOLIO BRIEF:
+For each coin:
+[COIN]: [bias] | Key level: $X | Action: hold / add at $X / reduce
+Summary: [overall portfolio risk — 2 sentences max]
+───
 
-MOMENTUM DIFFERENTIAL
-[Which is stronger right now and by how much]
-
-VOLUME QUALITY
-[Which has better vol/mcap ratio — more conviction]
-
-RELATIVE VERDICT
-[Which has stronger setup right now and why — one sentence]
----
-
-TYPE G — PORTFOLIO:
-For each coin in portfolio:
-[COIN]: [bias] | [key level] | [action: hold / add / reduce]
-Summary: [overall portfolio risk assessment — 2 sentences]
----
-
-══════════════════════════════════════════
+══════════════════════════════════════
 SIGNAL HIERARCHY
-══════════════════════════════════════════
-PRIMARY (form bias from these):
-1. Exchange net flow — inflow = sell pressure, outflow = accumulation
-2. Stablecoin supply direction — growing = dry powder, shrinking = deployed
-3. Funding + OI divergence — price up + OI up + high funding = crowded long
-4. CVD — sustained negative CVD with flat price = distribution
-5. Spot ETF flow — sustained outflows = institutional exit
+══════════════════════════════════════
+PRIMARY (form bias):
+1. Funding rate direction and magnitude
+2. OI trend — expanding into price up = conviction, expanding into price down = leverage build
+3. Long/short ratio extremes — >65% long = crowded, <35% long = short squeeze setup
+4. Liquidation cascade — >$100M/hour = forced selling, not organic
+5. Stablecoin supply direction — growing = dry powder, shrinking = deployed
 
 CONFIRMING (adjust conviction):
-6. Vol/MCap ratio — >0.08 high activity, <0.02 accumulation or disinterest
-7. BTC dominance trend — rising = alts bleeding, falling = rotation
-8. Fear & Greed extremes — <15 or >85 = contrarian signal only
-9. DeFi TVL — protocol TVL loss = capital leaving ecosystem
+6. Vol/MCap ratio — >8% elevated, <2% disinterest
+7. BTC dominance trend — rising = alts bleeding
+8. Fear & Greed extremes — <15 or >85 = contrarian only
+9. DeFi TVL direction
 
-NEVER PRIMARY: RSI | MACD | Bollinger Bands | MAs alone | Fear & Greed standalone
+NEVER PRIMARY: RSI | MACD | Bollinger Bands | MAs standalone | Fear & Greed alone
 
-══════════════════════════════════════════
-TONE
-══════════════════════════════════════════
+══════════════════════════════════════
+STYLE
+══════════════════════════════════════
 Bloomberg terminal analyst. Not crypto Twitter.
-Active voice. Short sentences. Every sentence contains information.
-No claim without a number. No padding. Quality over length."""
-
-# ── Coin alias map ────────────────────────────────────────────────────────────
-ALIASES = {
-    # BTC / ETH
-    "btc":"bitcoin","bitcoin":"bitcoin","eth":"ethereum","ethereum":"ethereum",
-    # Top L1
-    "sol":"solana","solana":"solana","bnb":"binancecoin","binance":"binancecoin",
-    "xrp":"ripple","ripple":"ripple","ada":"cardano","cardano":"cardano",
-    "avax":"avalanche-2","avalanche":"avalanche-2","dot":"polkadot","polkadot":"polkadot",
-    "trx":"tron","tron":"tron","ton":"the-open-network","near":"near",
-    "atom":"cosmos","cosmos":"cosmos","algo":"algorand","algorand":"algorand",
-    "hbar":"hedera-hashgraph","hedera":"hedera-hashgraph","icp":"internet-computer",
-    "fil":"filecoin","filecoin":"filecoin","kas":"kaspa","kaspa":"kaspa",
-    # L2 / Alt L1
-    "arb":"arbitrum","arbitrum":"arbitrum","op":"optimism","optimism":"optimism",
-    "matic":"matic-network","polygon":"matic-network","stx":"blockstack","stacks":"blockstack",
-    "sei":"sei-network","inj":"injective-protocol","injective":"injective-protocol",
-    "sui":"sui","apt":"aptos","aptos":"aptos","ftm":"fantom","fantom":"fantom",
-    "imx":"immutable-x","immutable":"immutable-x","zk":"zksync","zksync":"zksync",
-    "strk":"starknet","starknet":"starknet","w":"wormhole","wormhole":"wormhole",
-    # DeFi
-    "link":"chainlink","chainlink":"chainlink","uni":"uniswap","uniswap":"uniswap",
-    "aave":"aave","crv":"curve-dao-token","curve":"curve-dao-token",
-    "mkr":"maker","maker":"maker","ldo":"lido-dao","lido":"lido-dao",
-    "snx":"havven","synthetix":"havven","gmx":"gmx",
-    "jup":"jupiter-exchange-solana","jupiter":"jupiter-exchange-solana",
-    "comp":"compound-governance-token","compound":"compound-governance-token",
-    "dydx":"dydx","pendle":"pendle","eigen":"eigenlayer","eigenlayer":"eigenlayer",
-    "pyth":"pyth-network","grt":"the-graph","graph":"the-graph",
-    # AI / Infra
-    "tao":"bittensor","bittensor":"bittensor","fet":"fetch-ai","fetch":"fetch-ai",
-    "rndr":"render-token","render":"render-token","ocean":"ocean-protocol",
-    "wld":"worldcoin-wld","worldcoin":"worldcoin-wld","akash":"akash-network",
-    # Meme
-    "doge":"dogecoin","dogecoin":"dogecoin","shib":"shiba-inu","shiba":"shiba-inu",
-    "pepe":"pepe","wif":"dogwifcoin","bonk":"bonk","floki":"floki","meme":"meme-token",
-    # Other notable
-    "hype":"hyperliquid","hyperliquid":"hyperliquid","ena":"ethena","ethena":"ethena",
-    "trump":"official-trump","jto":"jito-governance-token","jito":"jito-governance-token",
-    "sandbox":"the-sandbox","mana":"decentraland","decentraland":"decentraland",
-    "blur":"blur","arkm":"arkham","gala":"gala","ondo":"ondo-finance","ondo":"ondo-finance",
-    "sui":"sui","move":"movement","not":"notcoin","notcoin":"notcoin",
-}
-
-async def resolve_coin(text: str) -> str | None:
-    """
-    Resolve coin from user text.
-    Priority: 1) alias map exact word match  2) CoinGecko search fallback
-    """
-    t = text.lower().strip()
-    words = re.findall(r"[a-z0-9]+", t)
-
-    # Check alias map — word boundary match
-    for word in words:
-        if word in ALIASES:
-            return ALIASES[word]
-
-    # CoinGecko search fallback — try each word
-    for word in words:
-        if len(word) < 2 or word in {
-            "the","is","a","an","should","i","my","about","what","think",
-            "buy","sell","good","bad","now","still","long","short","hold",
-            "add","into","this","that","and","or","for","with","how","why",
-            "when","where","scale","dca","do","you","me","it","not","be",
-        }:
-            continue
-        result = await cg("/search", {"query": word})
-        if not result or not result.get("coins"):
-            continue
-        top = result["coins"][0]
-        sym = top.get("symbol","").lower()
-        name = top.get("name","").lower()
-        if sym == word or name == word or name.startswith(word):
-            return top["id"]
-    return None
-
-async def fetch_coin_data(coin_id: str) -> str:
-    """Fetch full data for a specific coin and return formatted string."""
-    data = await cg("/coins/markets", {
-        "vs_currency": "usd",
-        "ids": f"{coin_id},bitcoin",
-        "price_change_percentage": "1h,24h,7d,30d",
-        "sparkline": "false",
-    })
-    if not data:
-        return f"Live data unavailable for {coin_id}. CoinGecko request failed."
-
-    lines = []
-    btc_price = None
-    for c in data:
-        if c["id"] == "bitcoin":
-            btc_price = c["current_price"]
-        if c["id"] != coin_id:
-            continue
-        ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
-        ch24h = c.get("price_change_percentage_24h") or 0
-        ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
-        ch30d = c.get("price_change_percentage_30d_in_currency") or 0
-        ath_pct = c.get("ath_change_percentage") or 0
-        mc    = c.get("market_cap") or 1
-        vol   = c.get("total_volume") or 0
-        vol_mc_ratio = (vol / mc * 100) if mc else 0
-        price = c.get("current_price", 0)
-
-        # BTC-relative performance
-        btc_rel = ""
-        if btc_price and btc_price > 0:
-            btc_rel = f"\n  vs BTC 24h:     {ch24h - 0:.2f}pp (raw: need BTC 24h for exact)"
-
-        lines.append(f"LIVE DATA: {c['name'].upper()} ({c['symbol'].upper()})")
-        lines.append(f"  Price:          ${price:,.4f}")
-        lines.append(f"  1h:             {fmtp(ch1h)}")
-        lines.append(f"  24h:            {fmtp(ch24h)}")
-        lines.append(f"  7d:             {fmtp(ch7d)}")
-        lines.append(f"  30d:            {fmtp(ch30d)}")
-        lines.append(f"  24h Range:      ${c.get('low_24h',0):,.4f} — ${c.get('high_24h',0):,.4f}")
-        lines.append(f"  vs ATH:         {ath_pct:.1f}%  (ATH: ${c.get('ath',0):,.4f})")
-        lines.append(f"  MCap:           {fmt(mc)}  |  Rank #{c.get('market_cap_rank','?')}")
-        lines.append(f"  Vol 24h:        {fmt(vol)}")
-        lines.append(f"  Vol/MCap:       {vol_mc_ratio:.1f}%  (>8% = elevated activity)")
-        lines.append(f"  Circulating:    {c.get('circulating_supply',0):,.0f}")
-        if c.get("max_supply"):
-            pct_issued = c["circulating_supply"] / c["max_supply"] * 100 if c.get("circulating_supply") else 0
-            lines.append(f"  Max Supply:     {c['max_supply']:,.0f}  ({pct_issued:.1f}% issued)")
-
-    if not lines:
-        return f"No data returned for coin_id: {coin_id}"
-
-    if btc_price:
-        lines.append(f"\nBTC CONTEXT: ${btc_price:,.2f} (for relative performance reference)")
-
-    return "\n".join(lines)
-
-# ── Data fetchers ──────────────────────────────────────────────────────────────
-
-async def data_market_snapshot(coin_ids: list = None) -> str:
-    ids = ",".join(coin_ids) if coin_ids else (
-        "bitcoin,ethereum,solana,binancecoin,ripple,cardano,avalanche-2,"
-        "chainlink,polkadot,tron,near,cosmos,arbitrum,optimism,sui"
-    )
-    coins, gdata = await asyncio.gather(
-        cg("/coins/markets", {
-            "vs_currency": "usd", "ids": ids,
-            "order": "market_cap_desc",
-            "price_change_percentage": "1h,24h,7d",
-            "sparkline": "false",
-        }),
-        cg("/global"),
-    )
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    lines = [f"LIVE MARKET DATA | {ts} UTC\n"]
-
-    if coins:
-        lines.append(f"{'SYM':6} {'PRICE':>12}  {'1H':>7}  {'24H':>7}  {'7D':>7}  {'VOL':>10}  {'MCAP':>10}")
-        lines.append("─" * 72)
-        for c in coins:
-            ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
-            ch24h = c.get("price_change_percentage_24h") or 0
-            ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
-            price = c.get("current_price", 0)
-            price_str = f"${price:,.2f}" if price >= 1 else f"${price:,.5f}"
-            lines.append(
-                f"{c['symbol'].upper():6} {price_str:>12}  "
-                f"{ch1h:>+6.2f}%  {ch24h:>+6.2f}%  {ch7d:>+6.2f}%  "
-                f"{fmt(c['total_volume']):>10}  {fmt(c['market_cap']):>10}"
-            )
-
-    if gdata and "data" in gdata:
-        g = gdata["data"]
-        btc_dom = g["market_cap_percentage"].get("btc", 0)
-        eth_dom = g["market_cap_percentage"].get("eth", 0)
-        total_mc = g.get("total_market_cap", {}).get("usd", 0)
-        mc_ch = g.get("market_cap_change_percentage_24h_usd", 0)
-        total_vol = g.get("total_volume", {}).get("usd", 0)
-        vol_mc = (total_vol / total_mc * 100) if total_mc else 0
-        lines.append(f"\nBTC Dom: {btc_dom:.2f}%  |  ETH Dom: {eth_dom:.2f}%  |  "
-                     f"Total MC: {fmt(total_mc)}  |  24h MC: {mc_ch:+.2f}%")
-        lines.append(f"Total Vol: {fmt(total_vol)}  |  Vol/MC Ratio: {vol_mc:.1f}%  "
-                     f"|  Active Cryptos: {g.get('active_cryptocurrencies','?')}")
-    return "\n".join(lines)
-
-async def data_dominance() -> str:
-    gdata, coins = await asyncio.gather(
-        cg("/global"),
-        cg("/coins/markets", {
-            "vs_currency": "usd",
-            "ids": "bitcoin,ethereum,tether,binancecoin,solana,ripple,"
-                   "usd-coin,tron,cardano,avalanche-2,chainlink,polkadot",
-            "order": "market_cap_desc",
-            "price_change_percentage": "24h,7d",
-        }),
-    )
-    ts = datetime.now(timezone.utc).strftime("%H:%M")
-    lines = [f"DOMINANCE & ROTATION | {ts} UTC\n"]
-
-    if gdata and "data" in gdata:
-        g = gdata["data"]
-        dom = g.get("market_cap_percentage", {})
-        btc_dom = dom.get("btc", 0)
-        eth_dom = dom.get("eth", 0)
-        lines.append(f"BTC Dominance: {btc_dom:.2f}%")
-        lines.append(f"ETH Dominance: {eth_dom:.2f}%")
-        lines.append(f"Stablecoin Dom (USDT+USDC): {dom.get('usdt',0)+dom.get('usdc',0):.2f}%")
-        lines.append(f"Total MC: {fmt(g['total_market_cap'].get('usd',0))}")
-        lines.append(f"Total Vol 24h: {fmt(g['total_volume'].get('usd',0))}")
-        lines.append("\nFull dominance breakdown:")
-        for sym, pct in sorted(dom.items(), key=lambda x: -x[1])[:10]:
-            lines.append(f"  {sym.upper():8} {pct:.3f}%")
-
-    if coins:
-        lines.append("\nTop assets — price vs BTC (7d):")
-        btc_7d = next((c.get("price_change_percentage_7d_in_currency",0) or 0
-                       for c in coins if c["id"] == "bitcoin"), 0)
-        for c in coins:
-            ch24 = c.get("price_change_percentage_24h") or 0
-            ch7d = c.get("price_change_percentage_7d_in_currency") or 0
-            rel_btc = (ch7d - btc_7d)
-            flag = " [OUTPERFORM]" if rel_btc > 2 else (" [UNDERPERFORM]" if rel_btc < -2 else "")
-            lines.append(
-                f"  {c['symbol'].upper():8} ${c['current_price']:>12,.4f}  "
-                f"24h:{ch24:>+6.2f}%  7d:{ch7d:>+6.2f}%  "
-                f"vs BTC 7d:{rel_btc:>+6.2f}%{flag}"
-            )
-    return "\n".join(lines)
-
-async def data_trending() -> str:
-    # Use market_cap_desc + price_change for gainers — percent_change param doesn't exist in CoinGecko
-    trending, market = await asyncio.gather(
-        cg("/search/trending"),
-        cg("/coins/markets", {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": "50",
-            "page": "1",
-            "price_change_percentage": "1h,24h",
-            "sparkline": "false",
-        }),
-    )
-    ts = datetime.now(timezone.utc).strftime("%H:%M")
-    lines = [f"TRENDING & NARRATIVE DATA | {ts} UTC\n"]
-
-    if trending and "coins" in trending:
-        lines.append("CoinGecko trending (search volume — last 24h):")
-        for i, item in enumerate(trending["coins"][:7], 1):
-            c = item["item"]
-            price_btc = c.get("price_btc", 0)
-            lines.append(
-                f"  {i}. {c['name']} ({c['symbol'].upper()})  "
-                f"Rank #{c.get('market_cap_rank','?')}  "
-                f"Score: {c.get('score',0)}"
-            )
-
-    if market:
-        gainers = sorted(
-            [c for c in market if c.get("price_change_percentage_24h") is not None],
-            key=lambda x: x["price_change_percentage_24h"], reverse=True
-        )[:7]
-        losers = sorted(
-            [c for c in market if c.get("price_change_percentage_24h") is not None],
-            key=lambda x: x["price_change_percentage_24h"]
-        )[:7]
-
-        lines.append("\nTop 24h gainers (top 50 by MCap):")
-        for c in gainers:
-            ch24 = c.get("price_change_percentage_24h") or 0
-            vol = c.get("total_volume", 0)
-            mc  = c.get("market_cap", 1)
-            vol_ratio = vol / mc * 100 if mc else 0
-            lines.append(
-                f"  {c['symbol'].upper():8} {ch24:>+6.2f}%  "
-                f"${c['current_price']:>10,.4f}  "
-                f"MCap:{fmt(mc):>9}  Vol/MC:{vol_ratio:.1f}%"
-            )
-
-        lines.append("\nTop 24h losers (top 50 by MCap):")
-        for c in losers:
-            ch24 = c.get("price_change_percentage_24h") or 0
-            vol = c.get("total_volume", 0)
-            mc  = c.get("market_cap", 1)
-            vol_ratio = vol / mc * 100 if mc else 0
-            lines.append(
-                f"  {c['symbol'].upper():8} {ch24:>+6.2f}%  "
-                f"${c['current_price']:>10,.4f}  "
-                f"MCap:{fmt(mc):>9}  Vol/MC:{vol_ratio:.1f}%"
-            )
-    return "\n".join(lines)
-
-async def data_defi() -> str:
-    tvl, protocols, chains = await asyncio.gather(
-        fetch(f"{LLAMA_BASE}/tvl"),
-        fetch(f"{LLAMA_BASE}/protocols"),
-        fetch(f"{LLAMA_BASE}/v2/chains"),
-    )
-    ts = datetime.now(timezone.utc).strftime("%H:%M")
-    lines = [f"DEFI TVL DATA (DeFiLlama) | {ts} UTC\n"]
-
-    if tvl:
-        try:
-            lines.append(f"Total DeFi TVL: {fmt(float(tvl))}")
-        except (ValueError, TypeError):
-            lines.append("Total DeFi TVL: unavailable")
-
-    if protocols:
-        valid = [p for p in protocols if p.get("tvl") and p["tvl"] > 0]
-        top = sorted(valid, key=lambda x: x["tvl"], reverse=True)[:12]
-        lines.append("\nTop 12 protocols by TVL:")
-        lines.append(f"  {'NAME':22} {'TVL':>10}  {'1D':>7}  {'7D':>7}  CHAIN")
-        lines.append("  " + "─" * 62)
-        for p in top:
-            ch1d = p.get("change_1d") or 0
-            ch7d = p.get("change_7d") or 0
-            lines.append(
-                f"  {p['name']:22} {fmt(p['tvl']):>10}  "
-                f"{ch1d:>+6.2f}%  {ch7d:>+6.2f}%  {p.get('chain','multi')}"
-            )
-
-    if chains:
-        valid_c = [c for c in chains if c.get("tvl") and c["tvl"] > 0]
-        top_c = sorted(valid_c, key=lambda x: x["tvl"], reverse=True)[:10]
-        lines.append("\nTop 10 chains by TVL:")
-        for c in top_c:
-            lines.append(f"  {c.get('name','?'):18} {fmt(c['tvl']):>10}")
-
-    return "\n".join(lines)
-
-async def data_fear_greed() -> str:
-    fng, gdata, stables, prices = await asyncio.gather(
-        fetch(FNG_URL),
-        cg("/global"),
-        cg("/coins/markets", {
-            "vs_currency": "usd",
-            "ids": "tether,usd-coin,dai,first-digital-usd,true-usd",
-            "order": "market_cap_desc",
-        }),
-        cg("/coins/markets", {
-            "vs_currency": "usd",
-            "ids": "bitcoin,ethereum",
-            "price_change_percentage": "1h,24h,7d",
-        }),
-    )
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    lines = [f"SENTIMENT DATA | {ts} UTC\n"]
-
-    # Live prices first — ground truth for model
-    if prices:
-        lines.append("CURRENT PRICES (live — use these for any trade setup):")
-        for c in prices:
-            ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
-            ch24h = c.get("price_change_percentage_24h") or 0
-            ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
-            lines.append(
-                f"  {c['symbol'].upper():5} ${c['current_price']:>12,.2f}  "
-                f"1h:{ch1h:>+6.2f}%  24h:{ch24h:>+6.2f}%  7d:{ch7d:>+6.2f}%"
-            )
-        lines.append("")
-
-    # Fear & Greed
-    if fng and "data" in fng:
-        lines.append("Fear & Greed Index (Alternative.me):")
-        for entry in fng["data"][:3]:
-            ts2 = datetime.fromtimestamp(int(entry["timestamp"]), tz=timezone.utc).strftime("%b %d")
-            val = int(entry["value"])
-            zone = entry["value_classification"]
-            lines.append(f"  {ts2}: {val:>3}/100 — {zone}")
-        lines.append("  (Below 20 = extreme fear / historical buy zone. Above 80 = extreme greed / fade zone.)")
-
-    # Global market
-    if gdata and "data" in gdata:
-        g = gdata["data"]
-        total_mc = g.get("total_market_cap", {}).get("usd", 0)
-        mc_ch    = g.get("market_cap_change_percentage_24h_usd", 0)
-        btc_dom  = g["market_cap_percentage"].get("btc", 0)
-        lines.append(f"\nTotal MC: {fmt(total_mc)}  |  24h: {mc_ch:+.2f}%")
-        lines.append(f"BTC Dom: {btc_dom:.2f}%")
-
-    # Stablecoin supply
-    if stables:
-        lines.append("\nStablecoin supply (dry powder proxy):")
-        total = 0
-        for s in stables:
-            mc  = s.get("market_cap", 0) or 0
-            vol = s.get("total_volume", 0) or 0
-            ratio = (vol / mc * 100) if mc else 0
-            total += mc
-            lines.append(
-                f"  {s['symbol'].upper():6} MCap:{fmt(mc):>10}  "
-                f"Vol:{fmt(vol):>10}  Vol/MCap:{ratio:.1f}%"
-            )
-        lines.append(f"  TOTAL STABLECOIN SUPPLY: {fmt(total)}")
-        lines.append("  (Supply growing = dry powder building. Vol/MCap >15% on USDT = large move imminent.)")
-
-    return "\n".join(lines)
-
-async def data_etf() -> str:
-    btc_d, eth_d = await asyncio.gather(
-        cg("/coins/bitcoin", {
-            "localization":"false","tickers":"false",
-            "market_data":"true","community_data":"false","developer_data":"false",
-        }),
-        cg("/coins/ethereum", {
-            "localization":"false","tickers":"false",
-            "market_data":"true","community_data":"false","developer_data":"false",
-        }),
-    )
-    ts = datetime.now(timezone.utc).strftime("%H:%M")
-    lines = [f"ETF & INSTITUTIONAL PROXY DATA | {ts} UTC\n"]
-    lines.append("Note: Direct ETF flow (BlackRock/Fidelity) requires SoSoValue or Bloomberg.")
-    lines.append("Below: institutional proxy signals from CoinGecko Pro.\n")
-
-    for label, d in [("BTC", btc_d), ("ETH", eth_d)]:
-        if not d:
-            lines.append(f"{label}: data unavailable")
-            continue
-        md = d.get("market_data", {}) or {}
-        price  = (md.get("current_price") or {}).get("usd", 0)
-        mc     = (md.get("market_cap") or {}).get("usd", 0)
-        vol    = (md.get("total_volume") or {}).get("usd", 0)
-        ath    = (md.get("ath") or {}).get("usd", 0)
-        ath_dt = ((md.get("ath_date") or {}).get("usd") or "?")[:10]
-        ath_pct= (md.get("ath_change_percentage") or {}).get("usd", 0)
-        circ   = md.get("circulating_supply", 0) or 0
-        maxs   = md.get("max_supply")
-        vol_mc = (vol / mc * 100) if mc else 0
-        ch24   = md.get("price_change_percentage_24h") or 0
-        ch7d   = (md.get("price_change_percentage_7d_in_currency") or {}).get("usd", 0)
-
-        lines.append(f"{label} INSTITUTIONAL PROXY:")
-        lines.append(f"  Price:          ${price:,.2f}  |  24h: {ch24:+.2f}%  |  7d: {ch7d:+.2f}%")
-        lines.append(f"  MCap:           {fmt(mc)}")
-        lines.append(f"  Vol 24h:        {fmt(vol)}  |  Vol/MCap: {vol_mc:.2f}%")
-        lines.append(f"  ATH:            ${ath:,.2f}  on {ath_dt}  ({ath_pct:.1f}% from ATH)")
-        lines.append(f"  Circulating:    {circ:,.0f}")
-        if maxs:
-            pct = circ / maxs * 100 if circ else 0
-            lines.append(f"  Max Supply:     {maxs:,.0f}  ({pct:.1f}% issued)")
-        lines.append(f"  Interpretation: Vol/MCap {vol_mc:.2f}% — "
-                     f"{'elevated institutional activity' if vol_mc > 8 else 'normal/low activity'}")
-        lines.append("")
-
-    lines.append("Live ETF flow: sosovalue.org | bloomberg terminal | theblock.co")
-    return "\n".join(lines)
-
-async def data_macro() -> str:
-    events = await cg("/events", {"upcoming_events_only": "true", "per_page": "15"})
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    lines = [f"MACRO & EVENT CALENDAR | {ts} UTC\n"]
-
-    lines.append("HIGH-IMPACT RECURRING EVENTS:")
-    lines.append("  [RED]    FOMC Meeting + Press Conference — rate decision, critical")
-    lines.append("  [RED]    US CPI Release (monthly) — inflation data, risk-on/off trigger")
-    lines.append("  [RED]    US NFP Jobs Report (1st Friday of month) — macro risk sentiment")
-    lines.append("  [AMBER]  BTC Options Expiry (every Friday, large on last Friday) — Deribit")
-    lines.append("  [AMBER]  Fed Speaker appearances — forward guidance shifts")
-    lines.append("  [AMBER]  US PPI Release — leads CPI")
-    lines.append("  [AMBER]  JOLTS / ADP — leads NFP")
-    lines.append("  [INFO]   Token unlocks — check tokenunlocks.app")
-    lines.append("  [INFO]   Governance votes — check snapshot.org")
-
-    if events and "data" in events:
-        lines.append("\nUPCOMING CRYPTO EVENTS (CoinGecko):")
-        for e in events["data"][:10]:
-            date  = (e.get("start_date") or "?")[:10]
-            title = e.get("title", "?")
-            etype = e.get("type", "?")
-            coin  = (e.get("coin") or {}).get("name", "General")
-            lines.append(f"  {date}  {title[:40]:42}  [{etype}]  {coin}")
-
-    lines.append("\nCALENDAR SOURCES:")
-    lines.append("  ForexFactory.com  |  Investing.com/economic-calendar  |  CMEGroup FedWatch")
-    return "\n".join(lines)
-
-async def data_watchlist(coin_ids: list) -> str:
-    if not coin_ids:
-        return "Watchlist empty. Use /watchlist add <coin-id>"
-    coins = await cg("/coins/markets", {
-        "vs_currency": "usd",
-        "ids": ",".join(coin_ids),
-        "order": "market_cap_desc",
-        "price_change_percentage": "1h,24h,7d,30d",
-        "sparkline": "false",
-    })
-    ts = datetime.now(timezone.utc).strftime("%H:%M")
-    lines = [f"WATCHLIST | {ts} UTC\n"]
-    if not coins:
-        return "Watchlist data unavailable. CoinGecko request failed."
-
-    # Index by id for ordering
-    coin_map = {c["id"]: c for c in coins}
-    for cid in coin_ids:
-        c = coin_map.get(cid)
-        if not c:
-            lines.append(f"  {cid}: data unavailable\n")
-            continue
-        ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
-        ch24h = c.get("price_change_percentage_24h") or 0
-        ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
-        ch30d = c.get("price_change_percentage_30d_in_currency") or 0
-        ath_pct = c.get("ath_change_percentage") or 0
-        mc    = c.get("market_cap", 0) or 0
-        vol   = c.get("total_volume", 0) or 0
-        vol_mc = (vol / mc * 100) if mc else 0
-        price = c.get("current_price", 0)
-        price_str = f"${price:,.4f}" if price < 1 else f"${price:,.2f}"
-
-        lines.append(f"{c['name']} ({c['symbol'].upper()})  Rank #{c.get('market_cap_rank','?')}")
-        lines.append(f"  Price:   {price_str}  |  vs ATH: {ath_pct:.1f}%")
-        lines.append(f"  1h:{ch1h:>+6.2f}%  24h:{ch24h:>+6.2f}%  7d:{ch7d:>+6.2f}%  30d:{ch30d:>+6.2f}%")
-        lines.append(f"  MCap:    {fmt(mc):>10}  |  Vol: {fmt(vol):>10}  |  Vol/MCap: {vol_mc:.1f}%")
-        lines.append("")
-    return "\n".join(lines)
-
-async def data_btc_full() -> str:
-    btc = await cg("/coins/bitcoin", {
-        "localization":"false","tickers":"false",
-        "market_data":"true","community_data":"true","developer_data":"false",
-    })
-    if not btc:
-        return "BTC data unavailable."
-    md = btc.get("market_data", {}) or {}
-    cd = btc.get("community_data", {}) or {}
-    ts = datetime.now(timezone.utc).strftime("%H:%M")
-    lines = [f"BTC FULL SNAPSHOT | {ts} UTC\n"]
-
-    price  = (md.get("current_price") or {}).get("usd", 0)
-    mc     = (md.get("market_cap") or {}).get("usd", 0)
-    vol    = (md.get("total_volume") or {}).get("usd", 0)
-    ath    = (md.get("ath") or {}).get("usd", 0)
-    ath_dt = ((md.get("ath_date") or {}).get("usd") or "?")[:10]
-    ath_pct= (md.get("ath_change_percentage") or {}).get("usd", 0)
-    atl    = (md.get("atl") or {}).get("usd", 0)
-    low24  = (md.get("low_24h") or {}).get("usd", 0)
-    high24 = (md.get("high_24h") or {}).get("usd", 0)
-    circ   = md.get("circulating_supply", 0) or 0
-    ch1h   = (md.get("price_change_percentage_1h_in_currency") or {}).get("usd", 0)
-    ch24   = md.get("price_change_percentage_24h", 0) or 0
-    ch7d   = (md.get("price_change_percentage_7d_in_currency") or {}).get("usd", 0)
-    ch30d  = (md.get("price_change_percentage_30d_in_currency") or {}).get("usd", 0)
-    ch1y   = (md.get("price_change_percentage_1y_in_currency") or {}).get("usd", 0)
-    vol_mc = (vol / mc * 100) if mc else 0
-    pct_mined = circ / 21_000_000 * 100
-
-    lines.append(f"Price:          ${price:,.2f}")
-    lines.append(f"1h:             {ch1h:+.2f}%")
-    lines.append(f"24h:            {ch24:+.2f}%")
-    lines.append(f"7d:             {ch7d:+.2f}%")
-    lines.append(f"30d:            {ch30d:+.2f}%")
-    lines.append(f"1y:             {ch1y:+.2f}%")
-    lines.append(f"24h Range:      ${low24:,.2f} — ${high24:,.2f}")
-    lines.append(f"MCap:           {fmt(mc)}")
-    lines.append(f"Vol 24h:        {fmt(vol)}  |  Vol/MCap: {vol_mc:.2f}%")
-    lines.append(f"ATH:            ${ath:,.2f}  on {ath_dt}  ({ath_pct:.1f}% from ATH)")
-    lines.append(f"ATL:            ${atl:,.4f}")
-    lines.append(f"Circulating:    {circ:,.0f} BTC  ({pct_mined:.2f}% of 21M mined)")
-
-    if cd:
-        tw = cd.get("twitter_followers", 0) or 0
-        rd = cd.get("reddit_subscribers", 0) or 0
-        if tw or rd:
-            lines.append(f"\nCommunity:      Twitter {tw:,}  |  Reddit {rd:,}")
-    return "\n".join(lines)
+Active voice. Short sentences. Every sentence = new information.
+No claim without a number. No padding. Concise beats comprehensive."""
 
 # ── Groq call ─────────────────────────────────────────────────────────────────
-async def call_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
+async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
     client = Groq(api_key=GROQ_KEY)
-    system = CIPHER_SYSTEM
-    if custom.strip():
-        system += f"\n\nANALYST PROFILE & CUSTOM INSTRUCTIONS:\n{custom}"
-
+    system = SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
     loop = asyncio.get_event_loop()
-    def _call():
+
+    def _sync_call():
         return client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=max_tokens,
-            temperature=0.2,
+            temperature=0.15,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
         )
+
     try:
-        resp = await asyncio.wait_for(
-            loop.run_in_executor(None, _call),
-            timeout=45.0
-        )
-        return resp.choices[0].message.content.strip() or "CIPHER: no output returned."
+        resp = await asyncio.wait_for(loop.run_in_executor(None, _sync_call), timeout=50)
+        return resp.choices[0].message.content.strip() or "CIPHER: empty response."
     except asyncio.TimeoutError:
-        return "CIPHER: Groq timeout (>45s). Try again or use a shorter query."
+        return "CIPHER: Groq timeout (50s). Try again."
     except Exception as e:
         logger.error(f"Groq error: {e}")
-        return f"CIPHER: AI call failed — {str(e)[:100]}"
+        return f"CIPHER: AI error — {str(e)[:120]}"
 
 # ── Send helper ───────────────────────────────────────────────────────────────
-async def send_long(update: Update, text: str):
-    """Split and send messages respecting Telegram's 4096 char limit."""
+async def send(update: Update, text: str):
     if not text.strip():
-        await update.message.reply_text("CIPHER: Empty response. Try again.")
+        await update.message.reply_text("CIPHER: no output. Try again.")
         return
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i+4000])
 
-async def typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ack(update: Update, context: ContextTypes.DEFAULT_TYPE, msg: str = "Fetching live data..."):
+    await update.message.reply_text(msg)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-# ── Command Handlers ──────────────────────────────────────────────────────────
+# ── Core question handler ─────────────────────────────────────────────────────
+async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, user: dict):
+    """
+    Unified handler for all free-text and /ask queries.
+    Detects coin, fetches relevant data, routes to correct CIPHER type.
+    """
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    coin = await resolve_coin(text)
+
+    if coin:
+        cg_id, gl_sym = coin
+        # Parallel fetch: coin data + market context + derivatives
+        coin_raw, market_raw, deriv = await asyncio.gather(
+            cg_coin(cg_id),
+            cg_market("bitcoin,ethereum"),
+            gl_multi(gl_sym),
+        )
+        funding, oi, liq, ls = deriv
+
+        # Build coin section
+        coin_section = ""
+        btc_24h = 0
+        if coin_raw:
+            coin_map = {c["id"]: c for c in coin_raw}
+            btc = coin_map.get("bitcoin")
+            btc_24h = btc.get("price_change_percentage_24h", 0) if btc else 0
+            target = coin_map.get(cg_id)
+            if target:
+                coin_section = format_coin_section(target, btc_24h)
+            else:
+                coin_section = f"CoinGecko returned no data for {cg_id}. ID may be incorrect."
+
+        deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
+
+        # BTC/ETH context
+        market_section = ""
+        if market_raw:
+            btc_data = next((c for c in market_raw if c["id"] == "bitcoin"), None)
+            eth_data = next((c for c in market_raw if c["id"] == "ethereum"), None)
+            ctx_lines = ["=== MARKET CONTEXT ==="]
+            for d in [btc_data, eth_data]:
+                if d:
+                    ctx_lines.append(
+                        f"{d['symbol'].upper():5} {price_str(d['current_price'])}  "
+                        f"24h:{pct(d.get('price_change_percentage_24h',0))}  "
+                        f"7d:{pct(d.get('price_change_percentage_7d_in_currency',0))}"
+                    )
+            market_section = "\n".join(ctx_lines)
+
+        prompt = (
+            f"{coin_section}\n\n"
+            f"{deriv_section}\n\n"
+            f"{market_section}\n\n"
+            f"USER QUESTION: {text}\n\n"
+            "Classify as TYPE B or TYPE C and respond with the correct CIPHER format.\n"
+            "CRITICAL: Use ONLY the live prices from the data above. Never use training-data prices."
+        )
+    else:
+        # General market question
+        market_raw, gdata, fng, stables = await asyncio.gather(
+            cg_market(),
+            cg_global(),
+            _fetch(FNG_URL, {}, {}),
+            cg("/coins/markets", {
+                "vs_currency": "usd",
+                "ids": "tether,usd-coin,dai",
+                "order": "market_cap_desc",
+            }),
+        )
+        # BTC derivatives for market-level queries
+        btc_deriv = await gl_multi("BTC")
+        btc_fund, btc_oi, btc_liq, btc_ls = btc_deriv
+
+        # Format market data
+        mkt_lines = [f"=== LIVE MARKET | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC ==="]
+        if market_raw:
+            mkt_lines.append(f"{'SYM':6} {'PRICE':>12}  {'1H':>7}  {'24H':>7}  {'7D':>7}  {'VOL':>10}  {'MCAP':>10}")
+            mkt_lines.append("─" * 72)
+            for c in market_raw:
+                ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
+                ch24h = c.get("price_change_percentage_24h") or 0
+                ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+                mkt_lines.append(
+                    f"{c['symbol'].upper():6} {price_str(c['current_price']):>12}  "
+                    f"{pct(ch1h):>7}  {pct(ch24h):>7}  {pct(ch7d):>7}  "
+                    f"{fmt(c['total_volume']):>10}  {fmt(c['market_cap']):>10}"
+                )
+
+        if gdata and "data" in gdata:
+            g = gdata["data"]
+            dom = g.get("market_cap_percentage", {})
+            total_mc = g.get("total_market_cap", {}).get("usd", 0)
+            total_vol = g.get("total_volume", {}).get("usd", 0)
+            mc_ch = g.get("market_cap_change_percentage_24h_usd", 0)
+            stable_dom = dom.get("usdt", 0) + dom.get("usdc", 0)
+            mkt_lines.append(
+                f"\nBTC Dom: {dom.get('btc',0):.2f}%  ETH Dom: {dom.get('eth',0):.2f}%  "
+                f"Stable Dom: {stable_dom:.2f}%"
+            )
+            mkt_lines.append(f"Total MC: {fmt(total_mc)}  24h: {mc_ch:+.2f}%  Vol: {fmt(total_vol)}")
+
+        # Stablecoin supply
+        stable_lines = ["=== STABLECOIN SUPPLY ==="]
+        if stables:
+            total_s = 0
+            for s in stables:
+                mc  = s.get("market_cap", 0) or 0
+                vol = s.get("total_volume", 0) or 0
+                ratio = (vol / mc * 100) if mc else 0
+                total_s += mc
+                stable_lines.append(
+                    f"{s['symbol'].upper():6} MCap:{fmt(mc):>10}  Vol:{fmt(vol):>10}  V/M:{ratio:.1f}%"
+                )
+            stable_lines.append(f"TOTAL: {fmt(total_s)}")
+
+        # Fear & Greed
+        fng_lines = ["=== FEAR & GREED ==="]
+        if fng and "data" in fng:
+            for entry in fng["data"][:3]:
+                ts2 = datetime.fromtimestamp(int(entry["timestamp"]), tz=timezone.utc).strftime("%b %d")
+                fng_lines.append(f"  {ts2}: {entry['value']}/100 — {entry['value_classification']}")
+
+        deriv_section = format_derivatives(btc_fund, btc_oi, btc_liq, btc_ls, "BTC")
+
+        prompt = (
+            "\n\n".join([
+                "\n".join(mkt_lines),
+                "\n".join(stable_lines),
+                "\n".join(fng_lines),
+                deriv_section,
+            ]) +
+            f"\n\nUSER QUESTION: {text}\n\n"
+            "Classify question type (A/B/C/D/E/F/G) and respond with correct CIPHER format.\n"
+            "Use ONLY live prices from data above."
+        )
+
+    result = await ask_groq(prompt, user.get("custom_instructions", ""))
+    await send(update, result)
+
+# ── Commands ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    get_user(user.id)
-    plan = "OWNER" if user.id == OWNER_ID else ("PRO" if is_pro(user.id) else "FREE")
+    u = update.effective_user
+    get_user(u.id)
+    plan = "OWNER" if u.id == OWNER_ID else ("PRO" if is_pro(u.id) else "FREE")
     await update.message.reply_text(
-        f"*CIPHER Intelligence*\n"
-        f"Welcome {user.first_name} | Plan: {plan}\n\n"
-        "*Commands:*\n"
-        "/cipher — Full 30-min cycle report\n"
-        "/btc — Deep BTC snapshot\n"
-        "/dominance — BTC dom + rotation\n"
-        "/trending — Trending + gainers/losers\n"
-        "/defi — DeFi TVL breakdown\n"
-        "/fear — Sentiment + stablecoin supply\n"
-        "/etf — Institutional proxy data\n"
-        "/macro — Event calendar\n"
-        "/watchlist — Your tracked coins\n"
-        "/ask [question] — Any question with live data\n"
-        "/setup — Custom analyst instructions\n"
-        "/help — Full command reference\n\n"
-        "Or just type anything — CIPHER responds with live data.",
+        f"*CIPHER Intelligence*  |  {plan}\n"
+        f"Welcome {u.first_name}\n\n"
+        "*Market:*  /cipher  /btc  /dominance  /trending\n"
+        "*DeFi:*    /defi\n"
+        "*Deriv:*   /derivatives  /funding  /oi\n"
+        "*Macro:*   /fear  /macro  /etf\n"
+        "*Tools:*   /watchlist  /ask  /setup  /help\n\n"
+        "Or just type any coin name, ticker, or question.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*CIPHER — Command Reference*\n\n"
-        "`/cipher` — Full cycle: market + on-chain + derivatives + macro + setup\n"
-        "`/btc` — BTC deep dive: all timeframes, supply, community\n"
-        "`/dominance` — BTC dom, ETH dom, altcoin rotation signals\n"
-        "`/trending` — CoinGecko trending + top gainers/losers with vol quality\n"
-        "`/defi` — DeFi TVL by protocol and chain (DeFiLlama live)\n"
-        "`/fear` — Fear & Greed + stablecoin supply + live BTC/ETH prices\n"
-        "`/etf` — Institutional proxy: Vol/MCap, ATH distance, supply\n"
-        "`/macro` — High-impact event calendar + upcoming crypto events\n"
-        "`/watchlist` — View tracked coins\n"
-        "`/watchlist add <coin-id>` — Add coin (use CoinGecko ID)\n"
-        "`/watchlist remove <coin-id>` — Remove coin\n"
-        "`/ask [question]` — Any question with live market context\n"
-        "`/setup` — Set custom instructions (trading style, focus coins, risk params)\n\n"
-        "*Free-text works too:*\n"
-        "Type a coin name, ticker, or any question — CIPHER fetches live data and responds.\n\n"
-        "*Examples:*\n"
-        "`what about tao` `should I scale into sei` `is link breaking out`\n"
-        "`compare sol vs avax` `explain funding rates` `any alerts right now`",
+        "*CIPHER — All Commands*\n\n"
+        "*Market Intelligence*\n"
+        "`/cipher` — Full cycle report: market + derivatives + macro + setup\n"
+        "`/btc` — BTC deep dive: all timeframes + full derivatives\n"
+        "`/dominance` — BTC/ETH dominance + rotation signals\n"
+        "`/trending` — Trending coins + gainers/losers + vol quality\n\n"
+        "*DeFi*\n"
+        "`/defi` — DeFi TVL by protocol + chain (DeFiLlama live)\n\n"
+        "*Derivatives (CoinGlass Pro)*\n"
+        "`/derivatives [coin]` — Funding + OI + long/short + liquidations\n"
+        "`/funding [coin]` — Funding rates across all exchanges\n"
+        "`/oi [coin]` — Open interest breakdown\n\n"
+        "*Macro & Sentiment*\n"
+        "`/fear` — Fear & Greed + stablecoin supply + live prices\n"
+        "`/etf` — Institutional proxy data\n"
+        "`/macro` — High-impact event calendar\n\n"
+        "*Personal*\n"
+        "`/watchlist` — Your tracked coins\n"
+        "`/watchlist add chainlink` — Add coin\n"
+        "`/watchlist remove chainlink` — Remove coin\n"
+        "`/ask [question]` — Any question with live data\n"
+        "`/setup` — Custom analyst profile\n\n"
+        "*Free-text works for everything:*\n"
+        "`what about tao`  `should I scale sei`  `is link breaking out`\n"
+        "`compare sol vs avax`  `explain funding rates`  `any alerts`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await update.message.reply_text("Fetching live data from CoinGecko + DeFiLlama + Alternative.me...")
-    await typing(update, context)
+    user = get_user(update.effective_user.id)
+    await ack(update, context, "Running full cycle — fetching CoinGecko + CoinGlass + DeFiLlama...")
 
-    market, defi, fear, trending = await asyncio.gather(
-        data_market_snapshot(),
-        data_defi(),
-        data_fear_greed(),
-        data_trending(),
+    market, gdata, defi_tvl, defi_proto, defi_chains, fng, stables, btc_deriv = await asyncio.gather(
+        cg_market(),
+        cg_global(),
+        ll("/tvl"),
+        ll("/protocols"),
+        ll("/v2/chains"),
+        _fetch(FNG_URL, {}, {}),
+        cg("/coins/markets", {"vs_currency":"usd","ids":"tether,usd-coin,dai","order":"market_cap_desc"}),
+        gl_multi("BTC"),
     )
+    funding, oi, liq, ls = btc_deriv
+
+    # Market table
+    mkt_lines = [f"LIVE MARKET | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+    if market:
+        mkt_lines.append(f"{'SYM':6} {'PRICE':>12}  {'1H':>7}  {'24H':>7}  {'7D':>7}  {'VOL':>10}  {'MCAP':>10}")
+        mkt_lines.append("─"*72)
+        for c in market:
+            ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
+            ch24h = c.get("price_change_percentage_24h") or 0
+            ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+            mkt_lines.append(
+                f"{c['symbol'].upper():6} {price_str(c['current_price']):>12}  "
+                f"{pct(ch1h):>7}  {pct(ch24h):>7}  {pct(ch7d):>7}  "
+                f"{fmt(c['total_volume']):>10}  {fmt(c['market_cap']):>10}"
+            )
+
+    if gdata and "data" in gdata:
+        g = gdata["data"]
+        dom = g.get("market_cap_percentage", {})
+        total_mc  = g.get("total_market_cap", {}).get("usd", 0)
+        total_vol = g.get("total_volume", {}).get("usd", 0)
+        mc_ch = g.get("market_cap_change_percentage_24h_usd", 0)
+        mkt_lines.append(
+            f"\nBTC Dom:{dom.get('btc',0):.2f}%  ETH Dom:{dom.get('eth',0):.2f}%  "
+            f"Total MC:{fmt(total_mc)}  24h:{mc_ch:+.2f}%  Vol:{fmt(total_vol)}"
+        )
+
+    # Stablecoin supply
+    sc_lines = ["STABLECOIN SUPPLY"]
+    if stables:
+        total_s = sum(s.get("market_cap",0) or 0 for s in stables)
+        for s in stables:
+            mc = s.get("market_cap",0) or 0
+            vol = s.get("total_volume",0) or 0
+            ratio = (vol/mc*100) if mc else 0
+            sc_lines.append(f"  {s['symbol'].upper():6} MCap:{fmt(mc):>10}  Vol:{fmt(vol):>10}  V/M:{ratio:.1f}%")
+        sc_lines.append(f"  TOTAL: {fmt(total_s)}")
+
+    # DeFi summary (top 5)
+    defi_lines = ["DEFI TVL SUMMARY"]
+    if defi_tvl:
+        try:
+            defi_lines.append(f"  Total DeFi TVL: {fmt(float(defi_tvl))}")
+        except Exception:
+            pass
+    if defi_proto:
+        top5 = sorted([p for p in defi_proto if p.get("tvl",0)>0], key=lambda x: x["tvl"], reverse=True)[:5]
+        for p in top5:
+            ch1d = p.get("change_1d") or 0
+            defi_lines.append(f"  {p['name']:20} {fmt(p['tvl']):>10}  1d:{ch1d:+.2f}%")
+
+    # Fear & Greed
+    fng_lines = ["FEAR & GREED"]
+    if fng and "data" in fng:
+        for entry in fng["data"][:2]:
+            ts2 = datetime.fromtimestamp(int(entry["timestamp"]), tz=timezone.utc).strftime("%b %d")
+            fng_lines.append(f"  {ts2}: {entry['value']}/100 — {entry['value_classification']}")
+
+    # BTC derivatives
+    deriv_section = format_derivatives(funding, oi, liq, ls, "BTC")
+
     prompt = (
-        f"{market}\n\n"
-        f"{fear}\n\n"
-        f"DEFI SUMMARY (top protocols):\n{chr(10).join(defi.split(chr(10))[:15])}\n\n"
-        f"TRENDING:\n{chr(10).join(trending.split(chr(10))[:20])}\n\n"
-        "TYPE A — Run full CIPHER cycle report.\n"
-        "For every metric: state the number AND what it means in the same sentence.\n"
-        "Stablecoin supply direction and Vol/MCap ratio are your on-chain proxy signals — interpret them.\n"
-        "Trending data shows retail positioning — separate from where real volume is.\n"
-        "Include TRADE SETUP only if 2+ independent signals align. Hard invalidation required.\n"
-        "End with ACTION line: trade / add / reduce / flat / wait and one specific reason."
+        "\n\n".join([
+            "\n".join(mkt_lines),
+            "\n".join(sc_lines),
+            "\n".join(fng_lines),
+            "\n".join(defi_lines),
+            deriv_section,
+        ]) +
+        "\n\nTYPE A — Full CIPHER cycle report.\n"
+        "For every metric: state the number AND its implication in the same sentence.\n"
+        "Derivatives are primary signals — lead with funding rate and OI interpretation.\n"
+        "Stablecoin total supply direction and Vol/MCap — interpret explicitly.\n"
+        "Trade setup only if 2+ signals align. Hard stop required.\n"
+        "End with ACTION line."
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""), max_tokens=2000)
-    await send_long(update, result)
+    result = await ask_groq(prompt, user.get("custom_instructions",""), max_tokens=2000)
+    await send(update, result)
 
 async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await typing(update, context)
-    btc_data = await data_btc_full()
-    prompt = (
-        f"{btc_data}\n\n"
-        "TYPE B — BTC BRIEF.\n"
-        "Price vs ATH: state the % gap and what it implies for downside risk at this level.\n"
-        "Vol/MCap ratio: is volume elevated or suppressed? What does the ratio say about conviction?\n"
-        "Momentum across 1h/24h/7d/30d: is the trend accelerating, decelerating, or reversing?\n"
-        "% mined: contextualise supply dynamics.\n"
-        "Community data: treat as contrarian — high follower count at tops, capitulation at bottoms.\n"
-        "End with VERDICT: SCALE IN / WAIT FOR LEVEL / AVOID — with specific price levels."
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    btc_full, btc_deriv = await asyncio.gather(
+        cg("/coins/bitcoin", {
+            "localization":"false","tickers":"false",
+            "market_data":"true","community_data":"true","developer_data":"false",
+        }),
+        gl_multi("BTC"),
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+    funding, oi, liq, ls = btc_deriv
+
+    # Format BTC data
+    btc_lines = [f"BTC FULL DATA | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
+    if btc_full:
+        md = btc_full.get("market_data", {}) or {}
+        cd = btc_full.get("community_data", {}) or {}
+        p     = (md.get("current_price") or {}).get("usd", 0)
+        mc    = (md.get("market_cap") or {}).get("usd", 0)
+        vol   = (md.get("total_volume") or {}).get("usd", 0)
+        ath   = (md.get("ath") or {}).get("usd", 0)
+        ath_p = (md.get("ath_change_percentage") or {}).get("usd", 0)
+        atl   = (md.get("atl") or {}).get("usd", 0)
+        lo    = (md.get("low_24h") or {}).get("usd", 0)
+        hi    = (md.get("high_24h") or {}).get("usd", 0)
+        circ  = md.get("circulating_supply", 0) or 0
+        ch1h  = (md.get("price_change_percentage_1h_in_currency") or {}).get("usd", 0)
+        ch24  = md.get("price_change_percentage_24h", 0) or 0
+        ch7d  = (md.get("price_change_percentage_7d_in_currency") or {}).get("usd", 0)
+        ch30d = (md.get("price_change_percentage_30d_in_currency") or {}).get("usd", 0)
+        ch1y  = (md.get("price_change_percentage_1y_in_currency") or {}).get("usd", 0)
+        vm    = (vol / mc * 100) if mc else 0
+        pct_mined = circ / 21_000_000 * 100
+
+        btc_lines += [
+            f"Price:       ${p:,.2f}",
+            f"1h:{pct(ch1h):>8}  24h:{pct(ch24):>8}  7d:{pct(ch7d):>8}  30d:{pct(ch30d):>8}  1y:{pct(ch1y):>8}",
+            f"24h Range:   ${lo:,.2f} — ${hi:,.2f}",
+            f"MCap:        {fmt(mc)}  |  Vol: {fmt(vol)}  |  Vol/MCap: {vm:.2f}%",
+            f"ATH:         ${ath:,.2f}  ({ath_p:.1f}% below ATH)",
+            f"ATL:         ${atl:,.4f}",
+            f"Circulating: {circ:,.0f}  ({pct_mined:.2f}% of 21M mined)",
+        ]
+        if cd:
+            tw = cd.get("twitter_followers", 0) or 0
+            btc_lines.append(f"Community:   Twitter {tw:,}")
+
+    deriv_section = format_derivatives(funding, oi, liq, ls, "BTC")
+
+    prompt = (
+        "\n".join(btc_lines) + "\n\n" + deriv_section + "\n\n"
+        "TYPE B — BTC BRIEF.\n"
+        "Price vs ATH: state % gap and what drawdown risk it implies at this level historically.\n"
+        "Vol/MCap: elevated or suppressed — what does this say about conviction?\n"
+        "Momentum across timeframes: accelerating / decelerating / reversing?\n"
+        "Derivatives: lead with funding rate interpretation, then OI, then long/short.\n"
+        "Liquidation context: any cascade risk?\n"
+        "End with VERDICT: SCALE IN / WAIT FOR LEVEL $X / AVOID — specific levels required."
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
+
+async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    # Get symbol from args or default to BTC
+    raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
+    # Resolve to CoinGlass symbol
+    gl_sym = raw_sym
+    coin = await resolve_coin(raw_sym.lower())
+    if coin:
+        gl_sym = coin[1]
+
+    await ack(update, context, f"Fetching {gl_sym} derivatives from CoinGlass...")
+    funding, oi, liq, ls = await gl_multi(gl_sym)
+    deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
+
+    prompt = (
+        f"{deriv_section}\n\n"
+        f"TYPE A — DERIVATIVES REPORT for {gl_sym}.\n"
+        "Funding rate: state average, trend, and what positioning it implies.\n"
+        "OI: expanding or contracting — what does the direction mean for price risk?\n"
+        "Long/short ratio: is the market crowded one way? Squeeze risk assessment.\n"
+        "Liquidations: any cascade in last hour? What level triggers the next cluster?\n"
+        "One-line derivatives bias: BULLISH / BEARISH / NEUTRAL with specific reason."
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
+
+async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
+    coin = await resolve_coin(raw_sym.lower())
+    gl_sym = coin[1] if coin else raw_sym
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    funding = await gl_funding(gl_sym)
+
+    lines = [f"FUNDING RATES — {gl_sym} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    total, count = 0, 0
+    if funding and funding.get("data"):
+        data = funding["data"]
+        exchanges = data if isinstance(data, list) else data.get("uMarginList", [])
+        for ex in (exchanges[:12] if exchanges else []):
+            name = ex.get("exchangeName", ex.get("exchange", "?"))
+            rate = ex.get("fundingRate", ex.get("rate", 0)) or 0
+            try:
+                rate = float(rate) * 100
+                total += rate
+                count += 1
+                flag = "  [EXTREME]" if abs(rate) > 0.1 else ("  [elevated]" if abs(rate) > 0.05 else "")
+                lines.append(f"  {name:14} {rate:>+8.4f}%{flag}")
+            except Exception:
+                pass
+        if count:
+            avg = total / count
+            interp = ("CROWDED LONG — shorts are cheap hedge" if avg > 0.08 else
+                      "CROWDED SHORT — squeeze potential" if avg < -0.03 else
+                      "NEUTRAL — no directional bias in funding")
+            lines.append(f"\nAverage:       {avg:>+8.4f}%")
+            lines.append(f"Interpretation: {interp}")
+    else:
+        lines.append("Funding data unavailable from CoinGlass.")
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        f"TYPE A — FUNDING RATE ANALYSIS for {gl_sym}.\n"
+        "State average funding rate and what the level implies for positioning.\n"
+        "Which exchanges show the most extreme rates? What does divergence between exchanges mean?\n"
+        "Crowded long: longs are paying — shorts have an edge. Crowded short: inverse.\n"
+        "One-line actionable: what does a trader do with this funding structure right now?"
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
+
+async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
+    coin = await resolve_coin(raw_sym.lower())
+    gl_sym = coin[1] if coin else raw_sym
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    oi_data = await gl_oi(gl_sym)
+
+    lines = [f"OPEN INTEREST — {gl_sym} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    if oi_data and oi_data.get("data"):
+        items = oi_data["data"]
+        items = items if isinstance(items, list) else items.get("data", [])
+        total_oi = sum(float(x.get("openInterest", x.get("oi", 0)) or 0) for x in items)
+        lines.append(f"Total OI: {fmt(total_oi)}\n")
+        for x in (items[:10] if items else []):
+            ex = x.get("exchangeName", x.get("exchange", "?"))
+            oi_val = float(x.get("openInterest", x.get("oi", 0)) or 0)
+            pct_share = (oi_val / total_oi * 100) if total_oi else 0
+            lines.append(f"  {ex:16} OI: {fmt(oi_val):>12}  ({pct_share:.1f}% share)")
+    else:
+        lines.append("OI data unavailable from CoinGlass.")
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        f"TYPE A — OPEN INTEREST ANALYSIS for {gl_sym}.\n"
+        "Total OI: is this elevated or normal for this asset?\n"
+        "Exchange concentration: if one exchange holds >50% OI, that is a risk.\n"
+        "OI rising with price up = conviction move. OI rising with price down = leverage trap.\n"
+        "One-line OI verdict: what does current OI level mean for near-term price risk?"
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await typing(update, context)
-    dom_data = await data_dominance()
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    gdata, top50 = await asyncio.gather(cg_global(), cg_top50())
+
+    lines = [f"DOMINANCE & ROTATION | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    if gdata and "data" in gdata:
+        g = gdata["data"]
+        dom = g.get("market_cap_percentage", {})
+        lines.append("Market cap dominance:")
+        for sym, val in sorted(dom.items(), key=lambda x: -x[1])[:10]:
+            lines.append(f"  {sym.upper():8} {val:.3f}%")
+        lines.append(f"\nTotal MC:  {fmt(g['total_market_cap'].get('usd',0))}")
+        lines.append(f"Total Vol: {fmt(g['total_volume'].get('usd',0))}")
+
+    if top50:
+        btc_7d = next((c.get("price_change_percentage_7d_in_currency",0) or 0
+                       for c in top50 if c["id"]=="bitcoin"), 0)
+        lines.append(f"\nTop 50 vs BTC (7d, BTC={pct(btc_7d)}):")
+        lines.append(f"{'SYM':8} {'PRICE':>12}  {'24H':>7}  {'7D':>7}  {'vsBTC7d':>9}  {'MCap':>10}")
+        lines.append("─"*62)
+        for c in top50:
+            ch24 = c.get("price_change_percentage_24h") or 0
+            ch7d = c.get("price_change_percentage_7d_in_currency") or 0
+            rel  = ch7d - btc_7d
+            flag = " *" if rel > 5 else ""
+            lines.append(
+                f"{c['symbol'].upper():8} {price_str(c['current_price']):>12}  "
+                f"{pct(ch24):>7}  {pct(ch7d):>7}  {rel:>+8.2f}%{flag}  {fmt(c['market_cap']):>10}"
+            )
+
     prompt = (
-        f"{dom_data}\n\n"
+        "\n".join(lines) + "\n\n"
         "TYPE A — DOMINANCE REPORT.\n"
-        "BTC dom: state exact % and historical context — does capital flow to alts at this level?\n"
-        "ETH dom vs BTC dom: if both falling = stablecoin rotation (fear). ETH rising + BTC falling = early alt season.\n"
-        "List every asset outperforming BTC on 7d with exact relative performance number.\n"
-        "Stablecoin dominance: growing stablecoin dom = risk-off, capital exiting.\n"
-        "Rotation thesis: one sentence with specific BTC dom level that triggers alt rotation."
+        "BTC dom: exact % and what it implies for alt performance at this level.\n"
+        "ETH dom vs BTC dom movement: diagnose rotation phase.\n"
+        "Stablecoin dom: growing = risk-off. Shrinking = capital deployed.\n"
+        "List all assets outperforming BTC on 7d (marked with *) — any pattern?\n"
+        "Rotation trigger: specific BTC dom level that would confirm alt season start."
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await typing(update, context)
-    trend_data = await data_trending()
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    trending, top50 = await asyncio.gather(cg_trending(), cg_top50())
+
+    lines = [f"TRENDING & NARRATIVE | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    if trending and "coins" in trending:
+        lines.append("CoinGecko trending (last 24h search volume):")
+        for i, item in enumerate(trending["coins"][:7], 1):
+            c = item["item"]
+            lines.append(
+                f"  {i}. {c['name']} ({c['symbol'].upper()})  "
+                f"Rank #{c.get('market_cap_rank','?')}  Score:{c.get('score',0)}"
+            )
+
+    if top50:
+        gainers = sorted(
+            [c for c in top50 if c.get("price_change_percentage_24h") is not None],
+            key=lambda x: x["price_change_percentage_24h"], reverse=True
+        )[:7]
+        losers = sorted(
+            [c for c in top50 if c.get("price_change_percentage_24h") is not None],
+            key=lambda x: x["price_change_percentage_24h"]
+        )[:7]
+
+        lines.append(f"\nTop gainers (top 50 by MCap):")
+        lines.append(f"  {'SYM':8} {'24H':>7}  {'PRICE':>12}  {'VOL/MCAP':>9}  {'MCAP':>10}")
+        for c in gainers:
+            ch24 = c.get("price_change_percentage_24h") or 0
+            mc   = c.get("market_cap", 1) or 1
+            vol  = c.get("total_volume", 0) or 0
+            vm   = vol / mc * 100
+            lines.append(
+                f"  {c['symbol'].upper():8} {pct(ch24):>7}  "
+                f"{price_str(c['current_price']):>12}  {vm:>8.1f}%  {fmt(mc):>10}"
+            )
+
+        lines.append(f"\nTop losers (top 50 by MCap):")
+        for c in losers:
+            ch24 = c.get("price_change_percentage_24h") or 0
+            mc   = c.get("market_cap", 1) or 1
+            vol  = c.get("total_volume", 0) or 0
+            vm   = vol / mc * 100
+            lines.append(
+                f"  {c['symbol'].upper():8} {pct(ch24):>7}  "
+                f"{price_str(c['current_price']):>12}  {vm:>8.1f}%  {fmt(mc):>10}"
+            )
+
     prompt = (
-        f"{trend_data}\n\n"
+        "\n".join(lines) + "\n\n"
         "TYPE A — TRENDING REPORT.\n"
-        "For each trending coin: Vol/MCap ratio separates organic from retail chase — state which for each.\n"
-        "Gainers: is volume expanding with the move (real) or thin (fragile)?\n"
-        "Losers: are fundamentally strong assets being sold (opportunity) or justified selloff?\n"
-        "Dominant narrative: name it in one sentence and state whether capital is behind it.\n"
-        "Flag any coin with >30% 24h gain and <$100M MCap — high manipulation probability."
+        "Vol/MCap ratio separates organic from retail chasing. State which for each gainer.\n"
+        "Flag any gainer with >30% gain and <$200M MCap — high manipulation probability.\n"
+        "Losers: are strong assets selling off (buy opportunity) or justified exit?\n"
+        "Dominant narrative in one sentence. Is there capital behind it or is it search noise?"
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await update.message.reply_text("Fetching DeFiLlama live data...")
-    await typing(update, context)
-    defi_data = await data_defi()
-    prompt = (
-        f"{defi_data}\n\n"
-        "TYPE A — DEFI REPORT.\n"
-        "Total TVL direction and what it implies for overall DeFi health.\n"
-        "Top 3 protocols gaining TVL: why? Which chains are capturing share?\n"
-        "Top 3 protocols losing TVL: is it a price effect or genuine capital exit?\n"
-        "Chain dominance shift: any chain gaining >2% share on 7d is a structural signal.\n"
-        "One sentence: where is smart capital moving in DeFi right now?"
+    user = get_user(update.effective_user.id)
+    await ack(update, context, "Fetching DeFiLlama live data...")
+
+    tvl, protocols, chains = await asyncio.gather(
+        ll("/tvl"), ll("/protocols"), ll("/v2/chains")
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+
+    lines = [f"DEFI TVL | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    if tvl:
+        try:
+            lines.append(f"Total DeFi TVL: {fmt(float(tvl))}")
+        except Exception:
+            pass
+
+    if protocols:
+        valid = sorted([p for p in protocols if p.get("tvl",0)>0],
+                       key=lambda x: x["tvl"], reverse=True)[:15]
+        lines.append(f"\n{'PROTOCOL':22} {'TVL':>10}  {'1D':>7}  {'7D':>7}  CHAIN")
+        lines.append("─"*62)
+        for p in valid:
+            ch1d = p.get("change_1d") or 0
+            ch7d = p.get("change_7d") or 0
+            lines.append(
+                f"{p['name']:22} {fmt(p['tvl']):>10}  "
+                f"{pct(ch1d):>7}  {pct(ch7d):>7}  {p.get('chain','multi')}"
+            )
+
+    if chains:
+        valid_c = sorted([c for c in chains if c.get("tvl",0)>0],
+                         key=lambda x: x["tvl"], reverse=True)[:10]
+        lines.append(f"\n{'CHAIN':18} {'TVL':>10}")
+        lines.append("─"*30)
+        for c in valid_c:
+            lines.append(f"{c.get('name','?'):18} {fmt(c['tvl']):>10}")
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        "TYPE A — DEFI REPORT.\n"
+        "Total TVL direction and implication for DeFi health.\n"
+        "Top 3 gaining TVL: which protocols and why — specific reason if determinable.\n"
+        "Top 3 losing TVL: price effect or genuine capital exit? Different implication.\n"
+        "Chain share shifts: any chain gaining >2% in 7d is a structural signal.\n"
+        "One sentence: where is capital moving in DeFi right now?"
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await typing(update, context)
-    fear_data = await data_fear_greed()
-    prompt = (
-        f"{fear_data}\n\n"
-        "TYPE A — SENTIMENT REPORT.\n"
-        "IMPORTANT: Use ONLY the live prices in CURRENT PRICES section for any trade levels.\n"
-        "Fear & Greed: state score, 3-day trend, and which zone (extreme fear/fear/neutral/greed/extreme greed).\n"
-        "Stablecoin total supply: growing = dry powder accumulating = potential fuel for upside. Shrinking = deployed.\n"
-        "USDT Vol/MCap >15% = abnormal turnover, large move imminent — flag if triggered.\n"
-        "Positioning implication: are traders over-extended long or is there capacity to absorb buying?\n"
-        "If trade setup warranted: use live BTC/ETH price from data. Hard stop required."
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    fng, gdata, stables, prices = await asyncio.gather(
+        _fetch(FNG_URL, {}, {}),
+        cg_global(),
+        cg("/coins/markets", {
+            "vs_currency":"usd",
+            "ids":"tether,usd-coin,dai,first-digital-usd",
+            "order":"market_cap_desc",
+        }),
+        cg_market("bitcoin,ethereum"),
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+
+    lines = [f"SENTIMENT DATA | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+    lines.append("CURRENT PRICES (use these for any trade levels):")
+    if prices:
+        for c in prices:
+            ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
+            ch24h = c.get("price_change_percentage_24h") or 0
+            ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+            lines.append(
+                f"  {c['symbol'].upper():5} {price_str(c['current_price']):>12}  "
+                f"1h:{pct(ch1h):>7}  24h:{pct(ch24h):>7}  7d:{pct(ch7d):>7}"
+            )
+
+    if fng and "data" in fng:
+        lines.append("\nFear & Greed (Alternative.me):")
+        for e in fng["data"][:3]:
+            ts2 = datetime.fromtimestamp(int(e["timestamp"]), tz=timezone.utc).strftime("%b %d")
+            lines.append(f"  {ts2}: {e['value']:>3}/100 — {e['value_classification']}")
+        lines.append("  Reference: <20 = extreme fear/historical bottom zone. >80 = extreme greed/top risk.")
+
+    if gdata and "data" in gdata:
+        g = gdata["data"]
+        dom = g.get("market_cap_percentage", {})
+        lines.append(f"\nTotal MC: {fmt(g['total_market_cap'].get('usd',0))}  "
+                     f"24h: {pct(g.get('market_cap_change_percentage_24h_usd',0))}")
+        lines.append(f"BTC Dom: {dom.get('btc',0):.2f}%")
+
+    if stables:
+        total_s = 0
+        lines.append("\nStablecoin supply:")
+        for s in stables:
+            mc  = s.get("market_cap",0) or 0
+            vol = s.get("total_volume",0) or 0
+            ratio = (vol/mc*100) if mc else 0
+            total_s += mc
+            lines.append(f"  {s['symbol'].upper():6} MCap:{fmt(mc):>10}  Vol:{fmt(vol):>10}  V/M:{ratio:.1f}%")
+        lines.append(f"  TOTAL: {fmt(total_s)}")
+        lines.append("  V/M >15% on USDT = large move likely imminent.")
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        "TYPE A — SENTIMENT REPORT.\n"
+        "CRITICAL: Use ONLY the live prices in CURRENT PRICES for any trade levels.\n"
+        "Fear & Greed score, 3-day trend, and which zone (extreme fear/fear/neutral/greed/extreme greed).\n"
+        "Stablecoin total supply direction: explicitly state growing or shrinking and implication.\n"
+        "USDT Vol/MCap: flag if >15% — that signals imminent large move.\n"
+        "Positioning implication: are traders over-extended or is there capacity to absorb buying?"
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await typing(update, context)
-    etf_data = await data_etf()
-    prompt = (
-        f"{etf_data}\n\n"
-        "TYPE A — INSTITUTIONAL PROXY REPORT.\n"
-        "Vol/MCap ratio: >8% = elevated institutional activity, <2% = accumulation or disinterest — state which.\n"
-        "ATH distance: what % drawdown are late-cycle ETF buyers sitting on? Contextualise the pain.\n"
-        "Supply issuance: BTC 94%+ mined = structural supply scarcity. ETH has no cap — different dynamic.\n"
-        "One-line institutional thesis: are conditions favourable for ETF inflows based on price structure and vol?"
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    btc_d, eth_d = await asyncio.gather(
+        cg("/coins/bitcoin", {"localization":"false","tickers":"false","market_data":"true",
+                              "community_data":"false","developer_data":"false"}),
+        cg("/coins/ethereum", {"localization":"false","tickers":"false","market_data":"true",
+                               "community_data":"false","developer_data":"false"}),
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+
+    lines = [f"INSTITUTIONAL PROXY DATA | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    lines.append("Note: live ETF flows require SoSoValue/Bloomberg. Below = proxy signals.\n")
+
+    for label, d in [("BTC", btc_d), ("ETH", eth_d)]:
+        if not d:
+            lines.append(f"{label}: data unavailable\n")
+            continue
+        md = d.get("market_data", {}) or {}
+        p     = (md.get("current_price") or {}).get("usd", 0)
+        mc    = (md.get("market_cap") or {}).get("usd", 0)
+        vol   = (md.get("total_volume") or {}).get("usd", 0)
+        ath   = (md.get("ath") or {}).get("usd", 0)
+        ath_p = (md.get("ath_change_percentage") or {}).get("usd", 0)
+        ath_d = ((md.get("ath_date") or {}).get("usd") or "?")[:10]
+        circ  = md.get("circulating_supply", 0) or 0
+        maxs  = md.get("max_supply")
+        vm    = (vol / mc * 100) if mc else 0
+        ch24  = md.get("price_change_percentage_24h", 0) or 0
+
+        lines.append(f"{label}:")
+        lines.append(f"  Price:    ${p:,.2f}  24h: {pct(ch24)}")
+        lines.append(f"  MCap:     {fmt(mc)}  |  Vol: {fmt(vol)}  |  Vol/MCap: {vm:.2f}%")
+        lines.append(f"  ATH:      ${ath:,.2f}  on {ath_d}  ({ath_p:.1f}%)")
+        lines.append(f"  Circ:     {circ:,.0f}")
+        if maxs:
+            lines.append(f"  Max:      {maxs:,.0f}  ({circ/maxs*100:.1f}% issued)")
+        lines.append(f"  Vol/MC interpretation: {'elevated — institutional desks active' if vm>8 else 'low — accumulation or disinterest'}")
+        lines.append("")
+
+    lines.append("Live ETF flows: sosovalue.org | farside.co.uk (BTC ETF tracker)")
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        "TYPE A — INSTITUTIONAL PROXY REPORT.\n"
+        "Vol/MCap: state exact % and what it implies about institutional desk activity.\n"
+        "ATH distance: contextualise the pain of late-cycle ETF buyers at current price.\n"
+        "Supply issuance: BTC 94%+ mined = structural scarcity. ETH = inflationary/deflationary based on burn.\n"
+        "One-line thesis: are conditions favourable for ETF inflows right now?"
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    await typing(update, context)
-    macro_data, market_data = await asyncio.gather(
-        data_macro(),
-        data_market_snapshot(["bitcoin", "ethereum"]),
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    events, prices = await asyncio.gather(
+        cg("/events", {"upcoming_events_only":"true","per_page":"15"}),
+        cg_market("bitcoin,ethereum"),
     )
+
+    lines = [f"MACRO & EVENTS | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+    if prices:
+        for c in prices:
+            lines.append(f"{c['symbol'].upper()}: {price_str(c['current_price'])}  "
+                         f"24h:{pct(c.get('price_change_percentage_24h',0))}")
+
+    lines.append("\nHIGH-IMPACT RECURRING EVENTS:")
+    lines.append("  [RED]    FOMC — rate decision, most important macro event for crypto")
+    lines.append("  [RED]    US CPI — monthly inflation, risk-on/off binary trigger")
+    lines.append("  [RED]    US NFP — 1st Friday each month, macro risk sentiment")
+    lines.append("  [AMBER]  BTC options expiry — every Friday, large monthly on last Fri (Deribit)")
+    lines.append("  [AMBER]  Fed speakers — forward guidance shifts move markets")
+    lines.append("  [AMBER]  US PPI — leads CPI, precursor signal")
+    lines.append("  [INFO]   Token unlocks — tokenunlocks.app")
+    lines.append("  [INFO]   Governance votes — snapshot.org")
+
+    if events and "data" in events:
+        lines.append("\nUPCOMING CRYPTO EVENTS (CoinGecko):")
+        for e in events["data"][:10]:
+            date  = (e.get("start_date") or "?")[:10]
+            title = e.get("title", "?")[:45]
+            etype = e.get("type", "?")
+            coin  = (e.get("coin") or {}).get("name", "General")
+            lines.append(f"  {date}  {title:47}  [{etype}]  {coin}")
+
+    lines.append("\nCalendar sources: ForexFactory.com  |  Investing.com  |  CMEGroup FedWatch")
+
     prompt = (
-        f"{macro_data}\n\n"
-        f"Current market:\n{market_data[:600]}\n\n"
+        "\n".join(lines) + "\n\n"
         "TYPE A — MACRO BRIEFING.\n"
-        "List upcoming events with specific crypto impact direction and the exact risk mechanism.\n"
-        "Current macro regime: rates, dollar strength, equity correlation — net positive or negative for crypto?\n"
-        "Pre-event playbook: what does a trader do in the 48h before FOMC/CPI? Specific recommendation.\n"
-        "One-line regime summary: risk-on / risk-off / transitional and the single number that defines it."
+        "Current macro regime: rates, dollar strength, equity correlation — net positive or negative?\n"
+        "List upcoming events with exact crypto impact direction and risk mechanism.\n"
+        "Pre-event playbook: 48h before FOMC/CPI — what does a trader do specifically?\n"
+        "One-line regime summary: risk-on / risk-off / transitional + single data point that defines it."
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    watchlist = user_data.get("watchlist", ["bitcoin", "ethereum"])
+    user = get_user(update.effective_user.id)
+    watchlist = user.get("watchlist", ["bitcoin", "ethereum"])
 
     if context.args:
         action = context.args[0].lower()
+
         if action == "add" and len(context.args) > 1:
-            coin = context.args[1].lower().strip()
+            raw = context.args[1].lower().strip()
             if len(watchlist) >= 20:
-                await update.message.reply_text("Watchlist limit: 20 coins. Remove one first.")
+                await update.message.reply_text("Watchlist limit: 20. Remove one first.")
                 return
-            if coin in watchlist:
-                await update.message.reply_text(f"{coin} already in watchlist.")
-                return
-            # Validate against CoinGecko
-            check = await cg(f"/coins/{coin}")
-            if not check or isinstance(check, dict) and check.get("error"):
-                # Try search
-                sr = await cg("/search", {"query": coin})
+            # Try alias resolution first
+            resolved = COINS.get(raw, (raw, raw.upper()))
+            cg_id = resolved[0]
+            # Validate
+            check = await cg(f"/coins/{cg_id}")
+            if not check or (isinstance(check, dict) and check.get("error")):
+                sr = await cg("/search", {"query": raw})
                 if sr and sr.get("coins"):
                     top = sr["coins"][0]
-                    cg_id = top["id"]
                     await update.message.reply_text(
-                        f"'{coin}' not found as CoinGecko ID.\n"
-                        f"Did you mean: {top['name']} ({top['symbol'].upper()}) — ID: {cg_id}?\n"
-                        f"Use: /watchlist add {cg_id}"
+                        f"'{raw}' not found.\n"
+                        f"Did you mean: {top['name']} ({top['symbol'].upper()}) — ID: `{top['id']}`?\n"
+                        f"Try: /watchlist add {top['id']}",
+                        parse_mode=ParseMode.MARKDOWN,
                     )
                 else:
                     await update.message.reply_text(
-                        f"Coin '{coin}' not found on CoinGecko.\n"
-                        f"Use the CoinGecko ID (e.g. 'chainlink', 'sei-network', 'bittensor')"
+                        f"'{raw}' not found on CoinGecko.\n"
+                        "Use CoinGecko IDs: chainlink, sei-network, bittensor, avalanche-2"
                     )
                 return
-            watchlist.append(coin)
-            user_data["watchlist"] = watchlist
-            save_user(update.effective_user.id, user_data)
-            await update.message.reply_text(f"Added: {coin}\nWatchlist: {', '.join(watchlist)}")
+            if cg_id in watchlist:
+                await update.message.reply_text(f"{cg_id} already in watchlist.")
+                return
+            watchlist.append(cg_id)
+            user["watchlist"] = watchlist
+            save_user(update.effective_user.id, user)
+            await update.message.reply_text(f"Added: {cg_id}\nWatchlist: {', '.join(watchlist)}")
             return
 
         elif action == "remove" and len(context.args) > 1:
-            coin = context.args[1].lower().strip()
-            if coin not in watchlist:
-                await update.message.reply_text(f"'{coin}' not in watchlist.")
+            raw = context.args[1].lower()
+            resolved = COINS.get(raw, (raw, ""))
+            cg_id = resolved[0]
+            target = cg_id if cg_id in watchlist else (raw if raw in watchlist else None)
+            if not target:
+                await update.message.reply_text(f"'{raw}' not in watchlist.")
                 return
-            watchlist.remove(coin)
-            user_data["watchlist"] = watchlist
-            save_user(update.effective_user.id, user_data)
-            await update.message.reply_text(f"Removed: {coin}\nWatchlist: {', '.join(watchlist)}")
+            watchlist.remove(target)
+            user["watchlist"] = watchlist
+            save_user(update.effective_user.id, user)
+            await update.message.reply_text(f"Removed: {target}\nWatchlist: {', '.join(watchlist)}")
             return
 
         elif action == "clear":
-            user_data["watchlist"] = []
-            save_user(update.effective_user.id, user_data)
+            user["watchlist"] = []
+            save_user(update.effective_user.id, user)
             await update.message.reply_text("Watchlist cleared.")
             return
 
-    # Default: show watchlist
     if not watchlist:
         await update.message.reply_text(
             "Watchlist is empty.\n"
-            "Add coins: /watchlist add chainlink\n"
-            "Use CoinGecko IDs (lowercase): bitcoin, ethereum, solana, sei-network, bittensor..."
+            "/watchlist add chainlink\n"
+            "/watchlist add sei-network\n"
+            "/watchlist add bittensor\n"
+            "Use lowercase CoinGecko IDs."
         )
         return
 
-    await typing(update, context)
-    wl_data = await data_watchlist(watchlist)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    coins_data = await cg("/coins/markets", {
+        "vs_currency": "usd",
+        "ids": ",".join(watchlist),
+        "order": "market_cap_desc",
+        "price_change_percentage": "1h,24h,7d,30d",
+        "sparkline": "false",
+    })
+
+    if not coins_data:
+        await update.message.reply_text("Watchlist data unavailable. CoinGecko request failed.")
+        return
+
+    btc_24h = next((c.get("price_change_percentage_24h",0) or 0
+                    for c in coins_data if c["id"]=="bitcoin"), 0)
+    coin_map = {c["id"]: c for c in coins_data}
+
+    lines = [f"WATCHLIST | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    for cid in watchlist:
+        c = coin_map.get(cid)
+        if not c:
+            lines.append(f"{cid}: data unavailable\n")
+            continue
+        lines.append(format_coin_section(c, btc_24h))
+        lines.append("")
+
     prompt = (
-        f"{wl_data}\n\n"
+        "\n".join(lines) + "\n\n"
         "TYPE G — WATCHLIST ANALYSIS.\n"
-        "For each coin: price context, 24h/7d momentum vs BTC, Vol/MCap signal, and a one-line verdict.\n"
-        "End with: which coin has the strongest setup right now and the specific reason why.\n"
-        "Use ONLY live prices from the data above."
+        "For each coin: one-line assessment covering momentum, Vol/MCap signal, and bias.\n"
+        "Rank them by setup quality right now — strongest to weakest.\n"
+        "Call out any with setup-breaking signals (extreme funding, vol collapse, ATH rejection).\n"
+        "End with: top pick and the specific reason in one sentence.\n"
+        "Use only live prices from data above."
     )
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
     await update.message.reply_text(
         f"Watchlist: {', '.join(watchlist)}\n"
-        f"Manage: /watchlist add <id> | /watchlist remove <id> | /watchlist clear\n"
+        "Manage: /watchlist add <id>  |  /watchlist remove <id>  |  /watchlist clear\n"
         "─────────────────────────────────"
     )
-    await send_long(update, result)
+    await send(update, result)
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
+    user = get_user(update.effective_user.id)
     question = " ".join(context.args).strip() if context.args else ""
     if not question:
         await update.message.reply_text(
-            "Usage: /ask [your question]\n\n"
+            "Usage: /ask [question]\n\n"
             "Examples:\n"
-            "  /ask should I scale into SEI right now\n"
-            "  /ask is BTC in a good buy zone\n"
-            "  /ask compare SOL vs AVAX\n"
-            "  /ask explain funding rate arbitrage\n"
-            "  /ask what is driving the market today"
+            "  /ask should I scale into SEI now\n"
+            "  /ask is BTC at a good entry\n"
+            "  /ask compare TAO vs RNDR\n"
+            "  /ask what is funding rate arbitrage\n"
+            "  /ask any alerts right now\n"
+            "  /ask explain open interest divergence"
         )
         return
-    await typing(update, context)
-    # Use same handler logic as free-text
-    await _handle_question(update, context, question, user_data)
-
-async def _handle_question(update, context, text: str, user_data: dict):
-    """Core question handler — used by both /ask and free-text."""
-    coin_id = await resolve_coin(text)
-
-    if coin_id:
-        coin_section, market_data = await asyncio.gather(
-            fetch_coin_data(coin_id),
-            data_market_snapshot(["bitcoin", "ethereum"]),
-        )
-        prompt = (
-            f"{coin_section}\n\n"
-            f"BROAD MARKET CONTEXT:\n{market_data}\n\n"
-            f"USER QUESTION: {text}\n\n"
-            "Classify as TYPE B or TYPE C and respond with the correct CIPHER format.\n"
-            "Use ONLY the live prices from the data above — not training data prices."
-        )
-    else:
-        # General question — pull full snapshot
-        market_data = await data_market_snapshot()
-        prompt = (
-            f"LIVE MARKET DATA:\n{market_data}\n\n"
-            f"USER QUESTION: {text}\n\n"
-            "Classify this question (TYPE A/B/C/D/E/F/G) and respond with the correct CIPHER format.\n"
-            "Use only live data provided."
-        )
-
-    result = await call_groq(prompt, user_data.get("custom_instructions",""))
-    await send_long(update, result)
+    await handle_query(update, context, question, user)
 
 # ── /setup conversation ───────────────────────────────────────────────────────
 async def cmd_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    current = user_data.get("custom_instructions","").strip()
+    user = get_user(update.effective_user.id)
+    current = user.get("custom_instructions","").strip()
     await update.message.reply_text(
-        f"*Custom Analyst Instructions*\n\n"
+        "*CIPHER — Custom Analyst Profile*\n\n"
         f"Current: `{current or 'none set'}`\n\n"
-        "Send your instructions to replace. This context gets injected into every CIPHER response.\n\n"
-        "Examples:\n"
-        "  Focus on SOL, LINK, ARB, TAO alongside BTC/ETH\n"
-        "  Swing trading, 3-5 day horizon. Not scalping.\n"
-        "  Max 2% risk per trade. Portfolio size $15,000.\n"
-        "  Currently long BTC at $82k and ETH at $2,100.\n"
-        "  Skip social analysis. Focus on on-chain and derivatives only.\n\n"
-        "Or /cancel to keep existing.",
+        "This context is injected into every CIPHER response. Be specific.\n\n"
+        "Good examples:\n"
+        "  Focus coins: BTC, ETH, SOL, LINK, TAO, SEI\n"
+        "  Style: swing trading, 3-7 day holds\n"
+        "  Risk: 2% max per trade, $20,000 portfolio\n"
+        "  Current positions: long BTC $82k, long ETH $2,100\n"
+        "  Priority: derivatives signals over price action\n\n"
+        "Type your profile now, or /cancel.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return WAITING_SETUP
 
 async def cmd_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    user_data["custom_instructions"] = update.message.text.strip()
-    save_user(update.effective_user.id, user_data)
+    user = get_user(update.effective_user.id)
+    user["custom_instructions"] = update.message.text.strip()
+    save_user(update.effective_user.id, user)
     await update.message.reply_text(
-        f"Saved. Active in all responses.\n\n`{user_data['custom_instructions']}`",
+        f"Saved. Active in all responses.\n\n`{user['custom_instructions']}`",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
 
 async def cmd_setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled. Instructions unchanged.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ── Free-text handler ─────────────────────────────────────────────────────────
+# ── Free-text ─────────────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     if not text:
         return
-    await typing(update, context)
-    await _handle_question(update, context, text, user_data)
+    user = get_user(update.effective_user.id)
+    await handle_query(update, context, text, user)
 
 # ── Error handler ─────────────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Unhandled exception:", exc_info=context.error)
+    logger.error("Unhandled error:", exc_info=context.error)
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text(
-            "An error occurred. Try again.\n"
-            "If it persists, check /help or report to the bot owner."
-        )
+        await update.message.reply_text("Error occurred. Try again. If persistent, use /help.")
 
-# ── Keep-alive (Render free tier) ─────────────────────────────────────────────
+# ── Keep-alive for Render free tier ──────────────────────────────────────────
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading, time
+import threading
 
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
@@ -1286,29 +1650,30 @@ class PingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"CIPHER OK")
-    def log_message(self, *args):
-        pass
+    def log_message(self, *args): pass
 
-def run_ping_server():
+def _start_keepalive():
     port = int(os.getenv("PORT", "8080"))
-    HTTPServer(("0.0.0.0", port), PingHandler).serve_forever()
-
-def self_ping_loop():
-    if not RENDER_URL:
-        return
-    time.sleep(60)
-    import urllib.request
-    while True:
-        try:
-            urllib.request.urlopen(f"{RENDER_URL}/", timeout=10)
-        except Exception:
-            pass
-        time.sleep(600)
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", port), PingHandler).serve_forever(),
+        daemon=True
+    ).start()
+    if RENDER_URL:
+        import urllib.request
+        def _ping():
+            import time
+            time.sleep(60)
+            while True:
+                try:
+                    urllib.request.urlopen(f"{RENDER_URL}/", timeout=10)
+                except Exception:
+                    pass
+                time.sleep(600)
+        threading.Thread(target=_ping, daemon=True).start()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    threading.Thread(target=run_ping_server, daemon=True).start()
-    threading.Thread(target=self_ping_loop, daemon=True).start()
+    _start_keepalive()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1318,18 +1683,26 @@ async def main():
         fallbacks=[CommandHandler("cancel", cmd_setup_cancel)],
     )
 
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("help",       cmd_help))
-    app.add_handler(CommandHandler("cipher",     cmd_cipher))
-    app.add_handler(CommandHandler("btc",        cmd_btc))
-    app.add_handler(CommandHandler("dominance",  cmd_dominance))
-    app.add_handler(CommandHandler("trending",   cmd_trending))
-    app.add_handler(CommandHandler("defi",       cmd_defi))
-    app.add_handler(CommandHandler("fear",       cmd_fear))
-    app.add_handler(CommandHandler("etf",        cmd_etf))
-    app.add_handler(CommandHandler("macro",      cmd_macro))
-    app.add_handler(CommandHandler("watchlist",  cmd_watchlist))
-    app.add_handler(CommandHandler("ask",        cmd_ask))
+    handlers = [
+        ("start",       cmd_start),
+        ("help",        cmd_help),
+        ("cipher",      cmd_cipher),
+        ("btc",         cmd_btc),
+        ("dominance",   cmd_dominance),
+        ("trending",    cmd_trending),
+        ("defi",        cmd_defi),
+        ("fear",        cmd_fear),
+        ("etf",         cmd_etf),
+        ("macro",       cmd_macro),
+        ("watchlist",   cmd_watchlist),
+        ("derivatives", cmd_derivatives),
+        ("funding",     cmd_funding),
+        ("oi",          cmd_oi),
+        ("ask",         cmd_ask),
+    ]
+    for name, handler in handlers:
+        app.add_handler(CommandHandler(name, handler))
+
     app.add_handler(setup_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
@@ -1337,23 +1710,25 @@ async def main():
     async with app:
         await app.initialize()
         await app.bot.set_my_commands([
-            BotCommand("cipher",    "Full 30-min intelligence cycle"),
-            BotCommand("btc",       "Deep BTC snapshot + analysis"),
-            BotCommand("dominance", "BTC dominance + altcoin rotation"),
-            BotCommand("trending",  "Trending coins + gainers/losers"),
-            BotCommand("defi",      "DeFi TVL by protocol + chain"),
-            BotCommand("fear",      "Fear & Greed + stablecoin supply"),
-            BotCommand("etf",       "ETF + institutional proxy data"),
-            BotCommand("macro",     "Macro event calendar"),
-            BotCommand("watchlist", "Your tracked coins"),
-            BotCommand("ask",       "Ask anything with live data"),
-            BotCommand("setup",     "Set custom analyst instructions"),
-            BotCommand("help",      "All commands + examples"),
+            BotCommand("cipher",      "Full cycle: market + derivatives + macro"),
+            BotCommand("btc",         "BTC deep dive with full derivatives"),
+            BotCommand("derivatives", "Funding + OI + long/short + liquidations"),
+            BotCommand("funding",     "Funding rates across all exchanges"),
+            BotCommand("oi",          "Open interest breakdown by exchange"),
+            BotCommand("dominance",   "BTC dominance + altcoin rotation"),
+            BotCommand("trending",    "Trending + gainers/losers + vol quality"),
+            BotCommand("defi",        "DeFi TVL by protocol + chain"),
+            BotCommand("fear",        "Fear & Greed + stablecoin supply"),
+            BotCommand("etf",         "Institutional proxy data"),
+            BotCommand("macro",       "Macro event calendar"),
+            BotCommand("watchlist",   "Your tracked coins"),
+            BotCommand("ask",         "Ask anything with live data"),
+            BotCommand("setup",       "Custom analyst profile"),
+            BotCommand("help",        "All commands + examples"),
         ])
-        logger.info("Commands registered.")
+        logger.info("CIPHER — Definitive Release — Online")
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        logger.info("CIPHER Bot — Production Release — Online")
         await asyncio.Event().wait()
         await app.updater.stop()
         await app.stop()
