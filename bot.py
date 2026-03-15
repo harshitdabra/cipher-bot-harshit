@@ -369,49 +369,40 @@ async def gl_oi(symbol: str = "BTC") -> dict | None:
     return None
 
 async def gl_liquidations(symbol: str = "BTC") -> dict | None:
-    # Coin Liquidation History — aggregated across exchanges
-    # Params: symbol (coin symbol), time_type (1h/4h/12h/24h)
-    # Do NOT pass limit — causes Server Error on this endpoint
-    result = await gl("/futures/liquidation/aggregated-history", {
-        "symbol": symbol,
-        "time_type": "1h",
-    })
+    # /futures/liquidation/coin-list — takes exchange param, returns all coins
+    # Filter by symbol after. Use Binance as most liquid exchange.
+    result = await gl("/futures/liquidation/coin-list", {"exchange": "Binance"})
     if result and result.get("data"):
-        return result
-    logger.warning(f"Liquidation failed for {symbol}: {str(result)[:150]}")
+        # Filter to the requested symbol
+        items = result["data"]
+        if isinstance(items, list):
+            match = [x for x in items if x.get("symbol","").upper() == symbol.upper()]
+            if match:
+                return {"data": match}
+            # Return all if no match — let format_derivatives handle it
+            return result
+    logger.warning(f"Liquidation coin-list failed: {str(result)[:150]}")
     return None
 
 async def gl_longshort(symbol: str = "BTC") -> dict | None:
-    # Global Long/Short Account Ratio — requires exchange + symbol pair
-    # Uses Binance BTCUSDT as most liquid/representative pair
+    # /futures/global-long-short-account-ratio/history
+    # Params: exchange=Binance, symbol=BTCUSDT, interval=4h
     pair_map = {
-        "BTC": ("Binance", "BTCUSDT"),
-        "ETH": ("Binance", "ETHUSDT"),
-        "SOL": ("Binance", "SOLUSDT"),
-        "BNB": ("Binance", "BNBUSDT"),
-        "XRP": ("Binance", "XRPUSDT"),
-        "ADA": ("Binance", "ADAUSDT"),
-        "AVAX": ("Binance", "AVAXUSDT"),
-        "LINK": ("Binance", "LINKUSDT"),
-        "ARB": ("Binance", "ARBUSDT"),
-        "OP":  ("Binance", "OPUSDT"),
-        "SEI": ("Binance", "SEIUSDT"),
-        "INJ": ("Binance", "INJUSDT"),
-        "SUI": ("Binance", "SUIUSDT"),
-        "APT": ("Binance", "APTUSDT"),
-        "DOGE": ("Binance", "DOGEUSDT"),
-        "TRX":  ("Binance", "TRXUSDT"),
+        "BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT","BNB":"BNBUSDT",
+        "XRP":"XRPUSDT","ADA":"ADAUSDT","AVAX":"AVAXUSDT","LINK":"LINKUSDT",
+        "ARB":"ARBUSDT","OP":"OPUSDT","SEI":"SEIUSDT","INJ":"INJUSDT",
+        "SUI":"SUIUSDT","APT":"APTUSDT","DOGE":"DOGEUSDT","TRX":"TRXUSDT",
+        "NEAR":"NEARUSDT","ATOM":"ATOMUSDT","DOT":"DOTUSDT","FTM":"FTMUSDT",
     }
-    exchange, pair = pair_map.get(symbol.upper(), ("Binance", f"{symbol.upper()}USDT"))
+    pair = pair_map.get(symbol.upper(), f"{symbol.upper()}USDT")
     result = await gl("/futures/global-long-short-account-ratio/history", {
-        "exchange": exchange,
-        "symbol": pair,
-        "time_type": "1h",
-        "limit": "1",
+        "exchange": "Binance",
+        "symbol":   pair,
+        "interval": "4h",
     })
     if result and result.get("data"):
         return result
-    logger.warning(f"Long/short failed for {symbol} ({exchange}/{pair}): {str(result)[:150]}")
+    logger.warning(f"Long/short failed for {symbol} (Binance/{pair}): {str(result)[:150]}")
     return None
 
 async def gl_etf_flows() -> dict | None:
@@ -434,9 +425,10 @@ async def gl_debug(symbol: str = "BTC") -> str:
     endpoints = [
         ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
         ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
-        ("/futures/liquidation/aggregated-history",          {"symbol": symbol, "time_type": "1h"}),
-        ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "time_type": "1h", "limit": "1"}),
         ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
+        ("/futures/liquidation/coin-list",                   {"exchange": "Binance"}),
+        ("/futures/liquidation/exchange-list",               {"symbol": symbol}),
+        ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "4h"}),
     ]
     lines = [f"API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
     lines.append(f"Base: {GLASS_BASE}")
@@ -553,41 +545,53 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     else:
         lines.append("\nOpen Interest: unavailable")
 
-    # Long/Short ratio
+    # Long/Short ratio — v4 fields: global_account_long_percent, global_account_short_percent
     if ls_data and ls_data.get("data"):
         items = ls_data["data"]
         items = items if isinstance(items, list) else []
         if items:
             latest = items[-1]
             try:
-                lr = float(latest.get("longRatio", latest.get("longAccount", 0)) or 0)
-                sr = float(latest.get("shortRatio", latest.get("shortAccount", 0)) or 0)
-                if lr < 2:   # decimal format → convert to %
+                lr = float(latest.get("global_account_long_percent",
+                           latest.get("longRatio", latest.get("longAccount", 0))) or 0)
+                sr = float(latest.get("global_account_short_percent",
+                           latest.get("shortRatio", latest.get("shortAccount", 0))) or 0)
+                ratio = float(latest.get("global_account_long_short_ratio", 0) or 0)
+                # Already in % format from v4
+                if lr < 2:  # decimal fallback
                     lr *= 100
                     sr *= 100
-                interp = ("Majority long — downside squeeze risk" if lr > 60
+                interp = ("Majority long — crowded, downside squeeze risk" if lr > 60
                           else "Majority short — upside squeeze potential" if lr < 40
-                          else "Balanced")
-                lines.append(f"\nLong/Short:  Long {lr:.1f}% / Short {sr:.1f}%  →  {interp}")
+                          else "Balanced positioning")
+                lines.append(f"\nLong/Short:  Long {lr:.1f}% / Short {sr:.1f}%")
+                if ratio:
+                    lines.append(f"  L/S Ratio: {ratio:.2f}x  →  {interp}")
+                else:
+                    lines.append(f"  →  {interp}")
             except (TypeError, ValueError):
                 lines.append("\nLong/Short: parse error")
     else:
         lines.append("\nLong/Short Ratio: unavailable")
 
-    # Liquidations
+    # Liquidations — coin-list returns {symbol, longLiquidationUsd24h, shortLiquidationUsd24h, ...}
     if liq_data and liq_data.get("data"):
         items = liq_data["data"]
         items = items if isinstance(items, list) else []
         if items:
-            latest = items[-1]
+            d = items[0]  # Already filtered to target symbol
             try:
-                long_liq  = float(latest.get("longLiquidationUsd",  latest.get("buyLiquidationUsd",  latest.get("buy",  0))) or 0)
-                short_liq = float(latest.get("shortLiquidationUsd", latest.get("sellLiquidationUsd", latest.get("sell", 0))) or 0)
+                # coin-list field names
+                long_liq  = float(d.get("longLiquidationUsd24h",  d.get("longLiquidationUsd",  d.get("buyLiquidationUsd",  d.get("buy",  0)))) or 0)
+                short_liq = float(d.get("shortLiquidationUsd24h", d.get("shortLiquidationUsd", d.get("sellLiquidationUsd", d.get("sell", 0)))) or 0)
                 total_liq = long_liq + short_liq
-                lines.append(f"\nLiquidations (1h): {fmt(total_liq)}")
+                period = "24h" if "24h" in str(d) or "24H" in str(d) else "recent"
+                lines.append(f"\nLiquidations ({period}): {fmt(total_liq)}")
                 lines.append(f"  Longs:  {fmt(long_liq)}  |  Shorts: {fmt(short_liq)}")
-                if total_liq > 50_000_000:
-                    lines.append(f"  [ELEVATED] — watch for cascade")
+                dom = "long-heavy" if long_liq > short_liq * 1.5 else ("short-heavy" if short_liq > long_liq * 1.5 else "balanced")
+                lines.append(f"  Liquidation bias: {dom}")
+                if total_liq > 100_000_000:
+                    lines.append(f"  [ELEVATED] >$100M — cascade risk active")
             except (TypeError, ValueError):
                 lines.append("\nLiquidations: parse error")
     else:
