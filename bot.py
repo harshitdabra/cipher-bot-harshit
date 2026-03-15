@@ -33,12 +33,11 @@ logger = logging.getLogger("CIPHER")
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GROQ_KEY        = os.getenv("GROQ_API_KEY", "")
 CG_KEY          = os.getenv("COINGECKO_API_KEY", "")
-CG_KEY          = os.getenv("COINGECKO_API_KEY", "")
 GLASS_KEY       = os.getenv("COINGLASS_API_KEY", "")
 OWNER_ID        = int(os.getenv("ALLOWED_USER_ID", "1953473977"))
 
 CG_BASE         = "https://pro-api.coingecko.com/api/v3"
-GLASS_BASE      = "https://open-api.coinglass.com/public/v2"  # CoinGlass v2
+GLASS_BASE      = "https://open-api.coinglass.com/public/v2"
 LLAMA_BASE      = "https://api.llama.fi"
 FNG_URL         = "https://api.alternative.me/fng/?limit=3"
 
@@ -346,21 +345,60 @@ async def cg_top50() -> list | None:
     })
 
 # ── CoinGlass data ─────────────────────────────────────────────────────────────
+# CoinGlass Pro v2 endpoint reference:
+# /funding_rates_symbol  -> funding per exchange
+# /open_interest         -> OI per exchange (WORKING - confirmed via live response)
+# /liquidation_chart     -> liquidation totals with time_type param
+# /global_long_short_account_ratio -> L/S ratio with time_type param
+# All use coinglassSecret header and ?symbol=BTC query param
+
 async def gl_funding(symbol: str = "BTC") -> dict | None:
-    """Funding rates across exchanges."""
-    return await gl("/funding_rates_symbol", {"symbol": symbol})
+    """Funding rates per exchange. CoinGlass v2: /funding_rates_symbol"""
+    # Try primary endpoint, fall back to alternate naming
+    result = await gl("/funding_rates_symbol", {"symbol": symbol})
+    if result and result.get("data"):
+        logger.info(f"CoinGlass funding OK for {symbol}")
+        return result
+    # Alternate endpoint name used in some CoinGlass API versions
+    result2 = await gl("/funding_rates", {"symbol": symbol})
+    if result2 and result2.get("data"):
+        logger.info(f"CoinGlass funding (alt) OK for {symbol}")
+        return result2
+    logger.warning(f"CoinGlass funding returned no data for {symbol}: {str(result)[:100]}")
+    return None
 
 async def gl_oi(symbol: str = "BTC") -> dict | None:
-    """Open interest by exchange."""
-    return await gl("/open_interest", {"symbol": symbol})
+    """Open interest per exchange. CoinGlass v2: /open_interest"""
+    result = await gl("/open_interest", {"symbol": symbol})
+    if result and result.get("data"):
+        return result
+    logger.warning(f"CoinGlass OI returned no data for {symbol}")
+    return None
 
-async def gl_liquidations(symbol: str = "BTC", time_range: str = "1h") -> dict | None:
-    """Liquidation data."""
-    return await gl("/liquidation_chart", {"symbol": symbol, "time_type": time_range})
+async def gl_liquidations(symbol: str = "BTC") -> dict | None:
+    """Liquidation chart data. CoinGlass v2: /liquidation_chart"""
+    # time_type values: 1h, 4h, 12h, 24h
+    result = await gl("/liquidation_chart", {"symbol": symbol, "time_type": "1h"})
+    if result and result.get("data"):
+        return result
+    # Some versions use different param name
+    result2 = await gl("/liquidation_chart", {"symbol": symbol, "timeType": "1h"})
+    if result2 and result2.get("data"):
+        return result2
+    logger.warning(f"CoinGlass liquidation returned no data for {symbol}: {str(result)[:100]}")
+    return None
 
 async def gl_longshort(symbol: str = "BTC") -> dict | None:
-    """Long/short account ratio."""
-    return await gl("/global_long_short_account_ratio", {"symbol": symbol, "time_type": "1h"})
+    """Long/short account ratio. CoinGlass v2: /global_long_short_account_ratio"""
+    result = await gl("/global_long_short_account_ratio", {"symbol": symbol, "time_type": "1h"})
+    if result and result.get("data"):
+        return result
+    # Alternate param
+    result2 = await gl("/global_long_short_account_ratio", {"symbol": symbol, "timeType": "1h"})
+    if result2 and result2.get("data"):
+        return result2
+    logger.warning(f"CoinGlass L/S returned no data for {symbol}: {str(result)[:100]}")
+    return None
 
 async def gl_multi(symbol: str = "BTC") -> tuple:
     """Fetch all CoinGlass data for a symbol in parallel."""
@@ -370,6 +408,38 @@ async def gl_multi(symbol: str = "BTC") -> tuple:
         gl_liquidations(symbol),
         gl_longshort(symbol),
     )
+
+async def gl_debug(symbol: str = "BTC") -> str:
+    """Debug helper: probe CoinGlass endpoints and return status report."""
+    endpoints = [
+        ("/funding_rates_symbol",            {"symbol": symbol}),
+        ("/funding_rates",                   {"symbol": symbol}),
+        ("/open_interest",                   {"symbol": symbol}),
+        ("/liquidation_chart",               {"symbol": symbol, "time_type": "1h"}),
+        ("/global_long_short_account_ratio", {"symbol": symbol, "time_type": "1h"}),
+    ]
+    lines = [f"CoinGlass API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
+    lines.append(f"Base URL: {GLASS_BASE}")
+    lines.append(f"Key configured: {'YES' if GLASS_KEY else 'NO — set COINGLASS_API_KEY'}")
+    lines.append("")
+    for ep, params in endpoints:
+        result = await _fetch(f"{GLASS_BASE}{ep}", {"coinglassSecret": GLASS_KEY}, params)
+        if result is None:
+            status = "FAIL (None — auth error or wrong path)"
+        elif not isinstance(result, dict):
+            status = f"FAIL (unexpected type: {type(result).__name__})"
+        elif result.get("data"):
+            data = result["data"]
+            if isinstance(data, list):
+                status = f"OK — list with {len(data)} items"
+            elif isinstance(data, dict):
+                status = f"OK — dict keys: {list(data.keys())[:4]}"
+            else:
+                status = f"OK — data type: {type(data).__name__}"
+        else:
+            status = f"EMPTY — keys: {list(result.keys())[:5]}, msg: {result.get('msg','')}"
+        lines.append(f"  {ep:45} {status}")
+    return "\n".join(lines)
 
 # ── Data formatters ───────────────────────────────────────────────────────────
 def format_coin_section(c: dict, btc_24h: float = 0) -> str:
@@ -410,7 +480,7 @@ def format_coin_section(c: dict, btc_24h: float = 0) -> str:
     return "\n".join(lines)
 
 def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) -> str:
-    lines = [f"=== {symbol} DERIVATIVES (CoinGlass) ==="]
+    lines = [f"=== {symbol} DERIVATIVES ==="]
 
     # Funding rates
     if funding_data and funding_data.get("data"):
@@ -435,7 +505,7 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
                       "CROWDED SHORT — squeeze risk" if avg < -0.03 else "NEUTRAL")
             lines.append(f"  Average:     {avg:>+7.4f}%  → {interp}")
     else:
-        lines.append("\nFunding Rates: data unavailable — check CoinGlass directly")
+        lines.append("\nFunding Rates: data unavailable")
 
     # Open Interest
     if oi_data and oi_data.get("data"):
@@ -723,7 +793,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             if target:
                 coin_section = format_coin_section(target, btc_24h)
             else:
-                coin_section = f"CoinGecko returned no data for {cg_id}. ID may be incorrect."
+                coin_section = f"No data for {cg_id}."
 
         deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
 
@@ -859,8 +929,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/dominance` — BTC/ETH dominance + rotation signals\n"
         "`/trending` — Trending coins + gainers/losers + vol quality\n\n"
         "*DeFi*\n"
-        "`/defi` — DeFi TVL by protocol + chain (DeFiLlama live)\n\n"
-        "*Derivatives (CoinGlass Pro)*\n"
+        "`/defi` — DeFi TVL by protocol + chain (live)\n\n"
+        "*Derivatives*\n"
         "`/derivatives [coin]` — Funding + OI + long/short + liquidations\n"
         "`/funding [coin]` — Funding rates across all exchanges\n"
         "`/oi [coin]` — Open interest breakdown\n\n"
@@ -882,7 +952,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
-    await ack(update, context, "Running full cycle — fetching CoinGecko + CoinGlass + DeFiLlama...")
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
     market, gdata, defi_tvl, defi_proto, defi_chains, fng, stables, btc_deriv = await asyncio.gather(
         cg_market(),
@@ -1047,18 +1117,35 @@ async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if coin:
         gl_sym = coin[1]
 
-    await ack(update, context, f"Fetching {gl_sym} derivatives from CoinGlass...")
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
     funding, oi, liq, ls = await gl_multi(gl_sym)
     deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
 
     prompt = (
         f"{deriv_section}\n\n"
-        f"TYPE A — DERIVATIVES REPORT for {gl_sym}.\n"
-        "Funding rate: state average, trend, and what positioning it implies.\n"
-        "OI: expanding or contracting — what does the direction mean for price risk?\n"
-        "Long/short ratio: is the market crowded one way? Squeeze risk assessment.\n"
-        "Liquidations: any cascade in last hour? What level triggers the next cluster?\n"
-        "One-line derivatives bias: BULLISH / BEARISH / NEUTRAL with specific reason."
+        f"Analyze the {gl_sym} derivatives data above. This is your ONLY data source — use it fully.\n\n"
+        "DERIVATIVES REPORT format:\n"
+        "FUNDING RATES\n"
+        "[Average rate across exchanges. Which exchanges are highest/lowest. "
+        "If avg >0.08%: longs paying heavily, crowded long. "
+        "If avg <-0.03%: shorts paying, squeeze risk. "
+        "If near zero: neutral positioning. State the exact average and interpretation.]\n\n"
+        "OPEN INTEREST\n"
+        "[Total OI in dollar terms. Exchange distribution — concentration risk if one exchange >50%. "
+        "What the OI level implies about leverage in the market.]\n\n"
+        "LONG/SHORT POSITIONING\n"
+        "[Exact ratio. If >60% long: crowded, downside risk on any negative catalyst. "
+        "If <40% long: short-heavy, upside squeeze potential. State which scenario applies.]\n\n"
+        "LIQUIDATION CONTEXT\n"
+        "[Last hour totals. Long vs short liquidation split. "
+        "If total >$50M/hr: elevated forced selling. Flag cascade risk if applicable.]\n\n"
+        "DERIVATIVES VERDICT\n"
+        "Bias: [BULLISH / BEARISH / NEUTRAL] — [one specific reason from the data]\n"
+        "Key risk: [what derivatives structure implies about next directional move]\n"
+        "Action: [trade / monitor / flat] — [one line]\n\n"
+        "RULES: Use only numbers from the data above. "
+        "If any section shows data unavailable, say so in one word and move on. "
+        "No emojis. No filler phrases."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
@@ -1096,7 +1183,7 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"\nAverage:       {avg:>+8.4f}%")
             lines.append(f"Interpretation: {interp}")
     else:
-        lines.append("Funding data unavailable from CoinGlass.")
+        lines.append("Funding data unavailable.")
 
     prompt = (
         "\n".join(lines) + "\n\n"
@@ -1130,7 +1217,7 @@ async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pct_share = (oi_val / total_oi * 100) if total_oi else 0
             lines.append(f"  {ex:16} OI: {fmt(oi_val):>12}  ({pct_share:.1f}% share)")
     else:
-        lines.append("OI data unavailable from CoinGlass.")
+        lines.append("OI data unavailable.")
 
     prompt = (
         "\n".join(lines) + "\n\n"
@@ -1195,7 +1282,7 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"TRENDING & NARRATIVE | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
     if trending and "coins" in trending:
-        lines.append("CoinGecko trending (last 24h search volume):")
+        lines.append("Trending (last 24h search volume):")
         for i, item in enumerate(trending["coins"][:7], 1):
             c = item["item"]
             lines.append(
@@ -1249,7 +1336,7 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
-    await ack(update, context, "Fetching DeFiLlama live data...")
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
     tvl, protocols, chains = await asyncio.gather(
         ll("/tvl"), ll("/protocols"), ll("/v2/chains")
@@ -1372,7 +1459,7 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     lines = [f"INSTITUTIONAL PROXY DATA | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
-    lines.append("Note: live ETF flows require SoSoValue/Bloomberg. Below = proxy signals.\n")
+    lines.append("Note: direct ETF flow data requires a premium terminal. Below = proxy signals.\n")
 
     for label, d in [("BTC", btc_d), ("ETH", eth_d)]:
         if not d:
@@ -1400,7 +1487,7 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  Vol/MC interpretation: {'elevated — institutional desks active' if vm>8 else 'low — accumulation or disinterest'}")
         lines.append("")
 
-    lines.append("Live ETF flows: sosovalue.org | farside.co.uk (BTC ETF tracker)")
+    lines.append("Live ETF flows: sosovalue.org | farside.co.uk")
 
     prompt = (
         "\n".join(lines) + "\n\n"
@@ -1439,7 +1526,7 @@ async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("  [INFO]   Governance votes — snapshot.org")
 
     if events and "data" in events:
-        lines.append("\nUPCOMING CRYPTO EVENTS (CoinGecko):")
+        lines.append("\nUPCOMING CRYPTO EVENTS:")
         for e in events["data"][:10]:
             date  = (e.get("start_date") or "?")[:10]
             title = e.get("title", "?")[:45]
@@ -1447,7 +1534,7 @@ async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE):
             coin  = (e.get("coin") or {}).get("name", "General")
             lines.append(f"  {date}  {title:47}  [{etype}]  {coin}")
 
-    lines.append("\nCalendar sources: ForexFactory.com  |  Investing.com  |  CMEGroup FedWatch")
+    lines.append("\nCalendar: ForexFactory.com  |  Investing.com  |  CMEGroup FedWatch")
 
     prompt = (
         "\n".join(lines) + "\n\n"
@@ -1468,52 +1555,56 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = context.args[0].lower()
 
         if action == "add" and len(context.args) > 1:
-            raw = context.args[1].lower().strip()
+            raw = " ".join(context.args[1:]).lower().strip()
             if len(watchlist) >= 20:
-                await update.message.reply_text("Watchlist limit: 20. Remove one first.")
+                await update.message.reply_text("Watchlist full (20 max). Remove one first.")
                 return
-            # Try alias resolution first
-            resolved = COINS.get(raw, (raw, raw.upper()))
-            cg_id = resolved[0]
-            # Validate
-            check = await cg(f"/coins/{cg_id}")
-            if not check or (isinstance(check, dict) and check.get("error")):
+            # Auto-resolve: ticker, name, or direct ID all work
+            coin_r = await resolve_coin(raw)
+            if coin_r:
+                cg_id = coin_r[0]
+            else:
+                # Last resort: search
                 sr = await cg("/search", {"query": raw})
                 if sr and sr.get("coins"):
-                    top = sr["coins"][0]
-                    await update.message.reply_text(
-                        f"'{raw}' not found.\n"
-                        f"Did you mean: {top['name']} ({top['symbol'].upper()}) — ID: `{top['id']}`?\n"
-                        f"Try: /watchlist add {top['id']}",
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
+                    cg_id = sr["coins"][0]["id"]
                 else:
-                    await update.message.reply_text(
-                        f"'{raw}' not found on CoinGecko.\n"
-                        "Use CoinGecko IDs: chainlink, sei-network, bittensor, avalanche-2"
-                    )
-                return
+                    await update.message.reply_text(f"Could not find '{raw}'. Try ticker or full name.")
+                    return
             if cg_id in watchlist:
-                await update.message.reply_text(f"{cg_id} already in watchlist.")
+                await update.message.reply_text(f"Already tracking {cg_id}.")
                 return
+            # Confirm valid + get display name
+            check = await cg(f"/coins/{cg_id}")
+            name_d = check.get("name", cg_id) if check else cg_id
+            sym_d  = (check.get("symbol") or "").upper() if check else ""
             watchlist.append(cg_id)
             user["watchlist"] = watchlist
             save_user(update.effective_user.id, user)
-            await update.message.reply_text(f"Added: {cg_id}\nWatchlist: {', '.join(watchlist)}")
+            label = f"{name_d} ({sym_d})" if sym_d else cg_id
+            await update.message.reply_text(f"Added: {label}\n{', '.join(watchlist)}")
             return
 
         elif action == "remove" and len(context.args) > 1:
-            raw = context.args[1].lower()
-            resolved = COINS.get(raw, (raw, ""))
-            cg_id = resolved[0]
+            raw = " ".join(context.args[1:]).lower().strip()
+            # Resolve to CoinGecko ID
+            coin_r = await resolve_coin(raw)
+            cg_id  = coin_r[0] if coin_r else raw
+            # Find in watchlist (exact or partial)
             target = cg_id if cg_id in watchlist else (raw if raw in watchlist else None)
             if not target:
-                await update.message.reply_text(f"'{raw}' not in watchlist.")
-                return
+                matches = [w for w in watchlist if raw in w or w.startswith(raw[:4])]
+                if len(matches) == 1:
+                    target = matches[0]
+                else:
+                    current = ", ".join(watchlist) if watchlist else "empty"
+                    await update.message.reply_text(f"'{raw}' not found.\nWatchlist: {current}")
+                    return
             watchlist.remove(target)
             user["watchlist"] = watchlist
             save_user(update.effective_user.id, user)
-            await update.message.reply_text(f"Removed: {target}\nWatchlist: {', '.join(watchlist)}")
+            remaining = ", ".join(watchlist) if watchlist else "empty"
+            await update.message.reply_text(f"Removed: {target}\nWatchlist: {remaining}")
             return
 
         elif action == "clear":
@@ -1528,7 +1619,7 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/watchlist add chainlink\n"
             "/watchlist add sei-network\n"
             "/watchlist add bittensor\n"
-            "Use lowercase CoinGecko IDs."
+            "Try: /watchlist add BTC or /watchlist add cardano"
         )
         return
 
@@ -1542,7 +1633,7 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     if not coins_data:
-        await update.message.reply_text("Watchlist data unavailable. CoinGecko request failed.")
+        await update.message.reply_text("Data unavailable. Try again.")
         return
 
     btc_24h = next((c.get("price_change_percentage_24h",0) or 0
@@ -1574,6 +1665,17 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "─────────────────────────────────"
     )
     await send(update, result)
+
+async def cmd_gltest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug command: tests all CoinGlass endpoints and reports status."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Owner only command.")
+        return
+    sym = " ".join(context.args).strip().upper() if context.args else "BTC"
+    await update.message.reply_text(f"Running endpoint tests for {sym}...")
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    report = await gl_debug(sym)
+    await send(update, report)
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
@@ -1699,6 +1801,7 @@ async def main():
         ("funding",     cmd_funding),
         ("oi",          cmd_oi),
         ("ask",         cmd_ask),
+        ("gltest",      cmd_gltest),
     ]
     for name, handler in handlers:
         app.add_handler(CommandHandler(name, handler))
