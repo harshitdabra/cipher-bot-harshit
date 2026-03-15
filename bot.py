@@ -579,21 +579,36 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
         items = liq_data["data"]
         items = items if isinstance(items, list) else []
         if items:
-            d = items[0]  # Already filtered to target symbol
+            d = items[0]
             try:
-                # coin-list field names
-                long_liq  = float(d.get("longLiquidationUsd24h",  d.get("longLiquidationUsd",  d.get("buyLiquidationUsd",  d.get("buy",  0)))) or 0)
-                short_liq = float(d.get("shortLiquidationUsd24h", d.get("shortLiquidationUsd", d.get("sellLiquidationUsd", d.get("sell", 0)))) or 0)
+                # Try all known field name patterns
+                long_liq = float(
+                    d.get("longLiquidationUsd24h") or
+                    d.get("longLiquidationUsd") or
+                    d.get("buyLiquidationUsd24h") or
+                    d.get("buyLiquidationUsd") or
+                    d.get("buy") or 0
+                )
+                short_liq = float(
+                    d.get("shortLiquidationUsd24h") or
+                    d.get("shortLiquidationUsd") or
+                    d.get("sellLiquidationUsd24h") or
+                    d.get("sellLiquidationUsd") or
+                    d.get("sell") or 0
+                )
                 total_liq = long_liq + short_liq
-                period = "24h" if "24h" in str(d) or "24H" in str(d) else "recent"
+                period = "24h"
                 lines.append(f"\nLiquidations ({period}): {fmt(total_liq)}")
                 lines.append(f"  Longs:  {fmt(long_liq)}  |  Shorts: {fmt(short_liq)}")
-                dom = "long-heavy" if long_liq > short_liq * 1.5 else ("short-heavy" if short_liq > long_liq * 1.5 else "balanced")
-                lines.append(f"  Liquidation bias: {dom}")
+                dom = ("long-heavy" if long_liq > short_liq * 1.5
+                       else "short-heavy" if short_liq > long_liq * 1.5
+                       else "balanced")
+                lines.append(f"  Bias: {dom}")
                 if total_liq > 100_000_000:
                     lines.append(f"  [ELEVATED] >$100M — cascade risk active")
-            except (TypeError, ValueError):
-                lines.append("\nLiquidations: parse error")
+            except Exception as e:
+                lines.append(f"\nLiquidations: parse error ({str(e)[:60]})")
+                lines.append(f"  Raw keys: {list(d.keys())[:8]}")
     else:
         lines.append("\nLiquidations: unavailable")
 
@@ -985,17 +1000,33 @@ async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
-    # Get symbol from args or default to BTC
     raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
-    # Resolve to CoinGlass symbol
     gl_sym = raw_sym
     coin = await resolve_coin(raw_sym.lower())
     if coin:
         gl_sym = coin[1]
 
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    funding, oi, liq, ls = await gl_multi(gl_sym)
-    deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
+    try:
+        funding, oi, liq, ls = await gl_multi(gl_sym)
+
+        # Log what we actually got for debugging
+        logger.info(f"Derivatives data for {gl_sym}: "
+                    f"funding={'OK' if funding and funding.get('data') else 'NONE'}, "
+                    f"oi={'OK' if oi and oi.get('data') else 'NONE'}, "
+                    f"liq={'OK('+str(len(liq['data']))+' items)' if liq and liq.get('data') else 'NONE'}, "
+                    f"ls={'OK' if ls and ls.get('data') else 'NONE'}")
+
+        # Log liq structure for field name discovery
+        if liq and liq.get("data"):
+            first = liq["data"][0] if liq["data"] else {}
+            logger.info(f"Liq item keys: {list(first.keys())}")
+
+        deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
+    except Exception as e:
+        logger.error(f"cmd_derivatives error for {gl_sym}: {e}", exc_info=True)
+        await update.message.reply_text(f"Derivatives data error: {str(e)[:200]}\nTry /funding or /oi instead.")
+        return
 
     prompt = (
         f"{deriv_section}\n\n"
