@@ -369,8 +369,12 @@ async def gl_oi(symbol: str = "BTC") -> dict | None:
     return None
 
 async def gl_liquidations(symbol: str = "BTC") -> dict | None:
+    # Coin Liquidation History — aggregated across exchanges
+    # Params: symbol (coin symbol), time_type (1h/4h/12h/24h)
+    # Do NOT pass limit — causes Server Error on this endpoint
     result = await gl("/futures/liquidation/aggregated-history", {
-        "symbol": symbol, "time_type": "1h", "limit": "1",
+        "symbol": symbol,
+        "time_type": "1h",
     })
     if result and result.get("data"):
         return result
@@ -378,12 +382,36 @@ async def gl_liquidations(symbol: str = "BTC") -> dict | None:
     return None
 
 async def gl_longshort(symbol: str = "BTC") -> dict | None:
+    # Global Long/Short Account Ratio — requires exchange + symbol pair
+    # Uses Binance BTCUSDT as most liquid/representative pair
+    pair_map = {
+        "BTC": ("Binance", "BTCUSDT"),
+        "ETH": ("Binance", "ETHUSDT"),
+        "SOL": ("Binance", "SOLUSDT"),
+        "BNB": ("Binance", "BNBUSDT"),
+        "XRP": ("Binance", "XRPUSDT"),
+        "ADA": ("Binance", "ADAUSDT"),
+        "AVAX": ("Binance", "AVAXUSDT"),
+        "LINK": ("Binance", "LINKUSDT"),
+        "ARB": ("Binance", "ARBUSDT"),
+        "OP":  ("Binance", "OPUSDT"),
+        "SEI": ("Binance", "SEIUSDT"),
+        "INJ": ("Binance", "INJUSDT"),
+        "SUI": ("Binance", "SUIUSDT"),
+        "APT": ("Binance", "APTUSDT"),
+        "DOGE": ("Binance", "DOGEUSDT"),
+        "TRX":  ("Binance", "TRXUSDT"),
+    }
+    exchange, pair = pair_map.get(symbol.upper(), ("Binance", f"{symbol.upper()}USDT"))
     result = await gl("/futures/global-long-short-account-ratio/history", {
-        "symbol": symbol, "time_type": "1h", "limit": "1",
+        "exchange": exchange,
+        "symbol": pair,
+        "time_type": "1h",
+        "limit": "1",
     })
     if result and result.get("data"):
         return result
-    logger.warning(f"Long/short failed for {symbol}: {str(result)[:150]}")
+    logger.warning(f"Long/short failed for {symbol} ({exchange}/{pair}): {str(result)[:150]}")
     return None
 
 async def gl_etf_flows() -> dict | None:
@@ -406,8 +434,8 @@ async def gl_debug(symbol: str = "BTC") -> str:
     endpoints = [
         ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
         ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
-        ("/futures/liquidation/aggregated-history",          {"symbol": symbol, "time_type": "1h", "limit": "1"}),
-        ("/futures/global-long-short-account-ratio/history", {"symbol": symbol, "time_type": "1h", "limit": "1"}),
+        ("/futures/liquidation/aggregated-history",          {"symbol": symbol, "time_type": "1h"}),
+        ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "time_type": "1h", "limit": "1"}),
         ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
     ]
     lines = [f"API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
