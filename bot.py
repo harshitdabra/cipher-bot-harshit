@@ -443,9 +443,10 @@ async def gl_debug(symbol: str = "BTC") -> str:
         elif result.get("data"):
             data = result["data"]
             if isinstance(data, list):
-                status = f"OK — list with {len(data)} items"
+                first_keys = list(data[0].keys())[:8] if data else []
+                status = f"OK — {len(data)} items | first item keys: {first_keys}"
             elif isinstance(data, dict):
-                status = f"OK — dict keys: {list(data.keys())[:4]}"
+                status = f"OK — dict keys: {list(data.keys())[:6]}"
             else:
                 status = f"OK — data type: {type(data).__name__}"
         else:
@@ -493,27 +494,33 @@ def format_coin_section(c: dict, btc_24h: float = 0) -> str:
 
 def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) -> str:
     """
-    Format CoinGlass v4 API responses.
-    v4 funding:  data=[{exchange, fundingRate, nextFundingTime}]
-    v4 oi:       data=[{exchange, openInterest, openInterestAmount}]
-    v4 liq:      data=[{t, longLiquidationUsd, shortLiquidationUsd}]
-    v4 ls:       data=[{longRatio, shortRatio, time}]
+    CoinGlass v4 exact field names (verified from live API):
+    funding: data = {symbol, stablecoin_margin_list: [{exchange, funding_rate, funding_rate_interval}]}
+    oi:      data = [{exchange, symbol, open_interest_usd, open_interest_change_percent_1h, ...}]
+    liq:     data = [{symbol, liquidation_usd_24h, long_liquidation_usd_24h, short_liquidation_usd_24h,
+                      liquidation_usd_1h, long_liquidation_usd_1h, short_liquidation_usd_1h}]
+    ls:      data = [{time, global_account_long_percent, global_account_short_percent, global_account_long_short_ratio}]
     """
     lines = [f"=== {symbol} DERIVATIVES ==="]
 
-    # Funding rates
+    # Funding rates — v4: data is a dict with stablecoin_margin_list
     if funding_data and funding_data.get("data"):
-        items = funding_data["data"]
-        items = items if isinstance(items, list) else []
+        raw = funding_data["data"]
+        # data is a dict {symbol, stablecoin_margin_list, token_margin_list}
+        # or a list — handle both
+        if isinstance(raw, list):
+            # list of {symbol, stablecoin_margin_list, ...}
+            raw = raw[0] if raw else {}
+        exchanges = raw.get("stablecoin_margin_list", [])
         lines.append("\nFunding Rates (per 8h):")
-        total, count = 0, 0
-        for ex in items[:10]:
-            name = ex.get("exchange", ex.get("exchangeName", "?"))
-            rate = ex.get("fundingRate", ex.get("rate", None))
+        total, count = 0.0, 0
+        for ex in exchanges[:12]:
+            name = ex.get("exchange", "?")
+            rate = ex.get("funding_rate", None)
             if rate is None:
                 continue
             try:
-                r = float(rate) * 100
+                r = float(rate) * 100  # convert to percentage
                 total += r
                 count += 1
                 flag = "  [EXTREME]" if abs(r) > 0.1 else ("  [elevated]" if abs(r) > 0.05 else "")
@@ -531,84 +538,72 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     else:
         lines.append("\nFunding Rates: unavailable")
 
-    # Open Interest
+    # Open Interest — v4: list of exchange objects, first item is "All" aggregate
     if oi_data and oi_data.get("data"):
         items = oi_data["data"]
-        items = items if isinstance(items, list) else []
-        total_oi = sum(float(x.get("openInterest", 0) or 0) for x in items)
+        items = items if isinstance(items, list) else [items]
+        # First item is aggregate "All"
+        agg = next((x for x in items if x.get("exchange") == "All"), items[0] if items else {})
+        total_oi = float(agg.get("open_interest_usd", 0) or 0)
+        ch1h = float(agg.get("open_interest_change_percent_1h", 0) or 0)
+        ch4h = float(agg.get("open_interest_change_percent_4h", 0) or 0)
+        ch24h = float(agg.get("open_interest_change_percent_24h", 0) or 0)
         lines.append(f"\nOpen Interest: {fmt(total_oi)}")
-        for x in items[:6]:
-            ex  = x.get("exchange", x.get("exchangeName", "?"))
-            oi  = float(x.get("openInterest", 0) or 0)
+        lines.append(f"  Change: 1h {ch1h:+.2f}%  4h {ch4h:+.2f}%  24h {ch24h:+.2f}%")
+        # Per-exchange breakdown
+        per_ex = [x for x in items if x.get("exchange") != "All"]
+        for x in per_ex[:6]:
+            ex  = x.get("exchange", "?")
+            oi  = float(x.get("open_interest_usd", 0) or 0)
             share = (oi / total_oi * 100) if total_oi else 0
             lines.append(f"  {ex:16} {fmt(oi):>12}  ({share:.1f}%)")
     else:
         lines.append("\nOpen Interest: unavailable")
 
-    # Long/Short ratio — v4 fields: global_account_long_percent, global_account_short_percent
+    # Long/Short ratio — v4: global_account_long_percent already in %
     if ls_data and ls_data.get("data"):
         items = ls_data["data"]
         items = items if isinstance(items, list) else []
         if items:
             latest = items[-1]
             try:
-                lr = float(latest.get("global_account_long_percent",
-                           latest.get("longRatio", latest.get("longAccount", 0))) or 0)
-                sr = float(latest.get("global_account_short_percent",
-                           latest.get("shortRatio", latest.get("shortAccount", 0))) or 0)
+                lr    = float(latest.get("global_account_long_percent", 0) or 0)
+                sr    = float(latest.get("global_account_short_percent", 0) or 0)
                 ratio = float(latest.get("global_account_long_short_ratio", 0) or 0)
-                # Already in % format from v4
-                if lr < 2:  # decimal fallback
-                    lr *= 100
-                    sr *= 100
-                interp = ("Majority long — crowded, downside squeeze risk" if lr > 60
+                interp = ("Majority long — crowded, downside risk" if lr > 60
                           else "Majority short — upside squeeze potential" if lr < 40
                           else "Balanced positioning")
-                lines.append(f"\nLong/Short:  Long {lr:.1f}% / Short {sr:.1f}%")
-                if ratio:
-                    lines.append(f"  L/S Ratio: {ratio:.2f}x  →  {interp}")
-                else:
-                    lines.append(f"  →  {interp}")
-            except (TypeError, ValueError):
-                lines.append("\nLong/Short: parse error")
+                lines.append(f"\nLong/Short:  Long {lr:.1f}% / Short {sr:.1f}%  (ratio {ratio:.2f}x)")
+                lines.append(f"  →  {interp}")
+            except (TypeError, ValueError) as e:
+                lines.append(f"\nLong/Short: parse error — {e}")
     else:
         lines.append("\nLong/Short Ratio: unavailable")
 
-    # Liquidations — coin-list returns {symbol, longLiquidationUsd24h, shortLiquidationUsd24h, ...}
+    # Liquidations — coin-list: exact field names confirmed
     if liq_data and liq_data.get("data"):
         items = liq_data["data"]
         items = items if isinstance(items, list) else []
         if items:
             d = items[0]
             try:
-                # Try all known field name patterns
-                long_liq = float(
-                    d.get("longLiquidationUsd24h") or
-                    d.get("longLiquidationUsd") or
-                    d.get("buyLiquidationUsd24h") or
-                    d.get("buyLiquidationUsd") or
-                    d.get("buy") or 0
-                )
-                short_liq = float(
-                    d.get("shortLiquidationUsd24h") or
-                    d.get("shortLiquidationUsd") or
-                    d.get("sellLiquidationUsd24h") or
-                    d.get("sellLiquidationUsd") or
-                    d.get("sell") or 0
-                )
-                total_liq = long_liq + short_liq
-                period = "24h"
-                lines.append(f"\nLiquidations ({period}): {fmt(total_liq)}")
-                lines.append(f"  Longs:  {fmt(long_liq)}  |  Shorts: {fmt(short_liq)}")
-                dom = ("long-heavy" if long_liq > short_liq * 1.5
-                       else "short-heavy" if short_liq > long_liq * 1.5
+                total_24h = float(d.get("liquidation_usd_24h", 0) or 0)
+                long_24h  = float(d.get("long_liquidation_usd_24h", 0) or 0)
+                short_24h = float(d.get("short_liquidation_usd_24h", 0) or 0)
+                total_1h  = float(d.get("liquidation_usd_1h", 0) or 0)
+                long_1h   = float(d.get("long_liquidation_usd_1h", 0) or 0)
+                short_1h  = float(d.get("short_liquidation_usd_1h", 0) or 0)
+                lines.append(f"\nLiquidations:")
+                lines.append(f"  24h total: {fmt(total_24h)}  (longs {fmt(long_24h)} / shorts {fmt(short_24h)})")
+                lines.append(f"  1h total:  {fmt(total_1h)}  (longs {fmt(long_1h)} / shorts {fmt(short_1h)})")
+                dom = ("long-heavy" if long_24h > short_24h * 1.5
+                       else "short-heavy" if short_24h > long_24h * 1.5
                        else "balanced")
                 lines.append(f"  Bias: {dom}")
-                if total_liq > 100_000_000:
-                    lines.append(f"  [ELEVATED] >$100M — cascade risk active")
+                if total_1h > 50_000_000:
+                    lines.append(f"  [ELEVATED] >$50M/hr — cascade risk")
             except Exception as e:
-                lines.append(f"\nLiquidations: parse error ({str(e)[:60]})")
-                lines.append(f"  Raw keys: {list(d.keys())[:8]}")
+                lines.append(f"\nLiquidations: parse error — {e}")
     else:
         lines.append("\nLiquidations: unavailable")
 
@@ -1165,17 +1160,21 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"FUNDING RATES — {gl_sym} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
     total, count = 0, 0
     if funding and funding.get("data"):
-        data = funding["data"]
-        exchanges = data if isinstance(data, list) else data.get("uMarginList", [])
-        for ex in (exchanges[:12] if exchanges else []):
-            name = ex.get("exchangeName", ex.get("exchange", "?"))
-            rate = ex.get("fundingRate", ex.get("rate", 0)) or 0
+        raw = funding["data"]
+        if isinstance(raw, list):
+            raw = raw[0] if raw else {}
+        exchanges = raw.get("stablecoin_margin_list", [])
+        for ex in exchanges[:12]:
+            name = ex.get("exchange", "?")
+            rate = ex.get("funding_rate", None)
+            if rate is None:
+                continue
             try:
-                rate = float(rate) * 100
-                total += rate
+                r = float(rate) * 100
+                total += r
                 count += 1
-                flag = "  [EXTREME]" if abs(rate) > 0.1 else ("  [elevated]" if abs(rate) > 0.05 else "")
-                lines.append(f"  {name:14} {rate:>+8.4f}%{flag}")
+                flag = "  [EXTREME]" if abs(r) > 0.1 else ("  [elevated]" if abs(r) > 0.05 else "")
+                lines.append(f"  {name:14} {r:>+8.4f}%{flag}")
             except Exception:
                 pass
         if count:
@@ -1211,14 +1210,20 @@ async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"OPEN INTEREST — {gl_sym} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
     if oi_data and oi_data.get("data"):
         items = oi_data["data"]
-        items = items if isinstance(items, list) else items.get("data", [])
-        total_oi = sum(float(x.get("openInterest", x.get("oi", 0)) or 0) for x in items)
-        lines.append(f"Total OI: {fmt(total_oi)}\n")
-        for x in (items[:10] if items else []):
-            ex = x.get("exchangeName", x.get("exchange", "?"))
-            oi_val = float(x.get("openInterest", x.get("oi", 0)) or 0)
-            pct_share = (oi_val / total_oi * 100) if total_oi else 0
-            lines.append(f"  {ex:16} OI: {fmt(oi_val):>12}  ({pct_share:.1f}% share)")
+        items = items if isinstance(items, list) else [items]
+        agg = next((x for x in items if x.get("exchange") == "All"), items[0] if items else {})
+        total_oi = float(agg.get("open_interest_usd", 0) or 0)
+        ch1h  = float(agg.get("open_interest_change_percent_1h", 0) or 0)
+        ch4h  = float(agg.get("open_interest_change_percent_4h", 0) or 0)
+        ch24h = float(agg.get("open_interest_change_percent_24h", 0) or 0)
+        lines.append(f"Total OI: {fmt(total_oi)}")
+        lines.append(f"Change: 1h {ch1h:+.2f}%  4h {ch4h:+.2f}%  24h {ch24h:+.2f}%\n")
+        per_ex = [x for x in items if x.get("exchange") != "All"]
+        for x in per_ex[:10]:
+            ex  = x.get("exchange", "?")
+            oi  = float(x.get("open_interest_usd", 0) or 0)
+            share = (oi / total_oi * 100) if total_oi else 0
+            lines.append(f"  {ex:16} OI: {fmt(oi):>12}  ({share:.1f}% share)")
     else:
         lines.append("OI data unavailable.")
 
@@ -1329,6 +1334,7 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         "\n".join(lines) + "\n\n"
         "TYPE A — TRENDING REPORT.\n"
+        "CRITICAL: Use ONLY the prices in the live data above. Do NOT use any historical or training-data prices.\n"
         "Vol/MCap ratio separates organic from retail chasing. State which for each gainer.\n"
         "Flag any gainer with >30% gain and <$200M MCap — high manipulation probability.\n"
         "Losers: are strong assets selling off (buy opportunity) or justified exit?\n"
@@ -1436,7 +1442,7 @@ async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_s += mc
             lines.append(f"  {s['symbol'].upper():6} MCap:{fmt(mc):>10}  Vol:{fmt(vol):>10}  V/M:{ratio:.1f}%")
         lines.append(f"  TOTAL: {fmt(total_s)}")
-        lines.append("  V/M >15% on USDT = large move likely imminent.")
+        lines.append("  Note: USDT V/M is typically 20-60% — only flag if >3x its own 30d average.")
 
     prompt = (
         "\n".join(lines) + "\n\n"
