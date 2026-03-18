@@ -996,7 +996,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             defi_lines = ["Top protocols:"]
             for p in valid:
                 ch1d = p.get("change_1d") or 0
-                defi_lines.append(f"  {p['name']:20} {fmt(p['tvl']):>10}  1d:{ch1d:+.2f}%")
+                defi_lines.append(f"  {p['name']:20} {fmt(p.get('tvl') or 0):>10}  1d:{ch1d:+.2f}%")
             sections.append("\n".join(defi_lines))
         except Exception:
             pass
@@ -1142,7 +1142,7 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top5 = sorted([p for p in defi_proto if float(p.get("tvl") or 0)>0], key=lambda x: float(x.get("tvl") or 0), reverse=True)[:5]
         for p in top5:
             ch1d = p.get("change_1d") or 0
-            defi_lines.append(f"  {p['name']:20} {fmt(p['tvl']):>10}  1d:{ch1d:+.2f}%")
+            defi_lines.append(f"  {p['name']:20} {fmt(p.get('tvl') or 0):>10}  1d:{ch1d:+.2f}%")
 
     # Fear & Greed
     fng_lines = ["FEAR & GREED"]
@@ -1513,7 +1513,7 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ch1d = p.get("change_1d") or 0
             ch7d = p.get("change_7d") or 0
             lines.append(
-                f"{p['name']:22} {fmt(p['tvl']):>10}  "
+                f"{p['name']:22} {fmt(p.get('tvl') or 0):>10}  "
                 f"{pct(ch1d):>7}  {pct(ch7d):>7}  {p.get('chain','multi')}"
             )
 
@@ -1523,7 +1523,7 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n{'CHAIN':18} {'TVL':>10}")
         lines.append("─"*30)
         for c in valid_c:
-            lines.append(f"{c.get('name','?'):18} {fmt(c['tvl']):>10}")
+            lines.append(f"{c.get('name','?'):18} {fmt(c.get('tvl') or 0):>10}")
 
     prompt = (
         "\n".join(lines) + "\n\n"
