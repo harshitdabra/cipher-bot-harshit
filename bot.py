@@ -410,19 +410,29 @@ async def gl_oi(symbol: str = "BTC") -> dict | None:
     return None
 
 async def gl_liquidations(symbol: str = "BTC") -> dict | None:
-    # /futures/liquidation/coin-list — takes exchange param, returns all coins
-    # Filter by symbol after. Use Binance as most liquid exchange.
-    result = await gl("/futures/liquidation/coin-list", {"exchange": "Binance"})
+    """
+    /futures/liquidation/history
+    Fields: time, long_liquidation_usd, short_liquidation_usd
+    Returns last 3 daily candles for Binance BTCUSDT (or relevant pair).
+    """
+    pair_map = {
+        "BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT","BNB":"BNBUSDT",
+        "XRP":"XRPUSDT","ADA":"ADAUSDT","AVAX":"AVAXUSDT","LINK":"LINKUSDT",
+        "ARB":"ARBUSDT","OP":"OPUSDT","SEI":"SEIUSDT","INJ":"INJUSDT",
+        "SUI":"SUIUSDT","APT":"APTUSDT","DOGE":"DOGEUSDT","TRX":"TRXUSDT",
+        "NEAR":"NEARUSDT","ATOM":"ATOMUSDT","DOT":"DOTUSDT","PEPE":"PEPEUSDT",
+        "SHIB":"SHIBUSDT","WIF":"WIFUSDT","TAO":"TAOUSDT",
+    }
+    pair = pair_map.get(symbol.upper(), f"{symbol.upper()}USDT")
+    result = await gl("/futures/liquidation/history", {
+        "exchange": "Binance",
+        "symbol": pair,
+        "interval": "1d",
+        "limit": "3",
+    })
     if result and result.get("data"):
-        # Filter to the requested symbol
-        items = result["data"]
-        if isinstance(items, list):
-            match = [x for x in items if x.get("symbol","").upper() == symbol.upper()]
-            if match:
-                return {"data": match}
-            # Return all if no match — let format_derivatives handle it
-            return result
-    logger.warning(f"Liquidation coin-list failed: {str(result)[:150]}")
+        return result
+    logger.warning(f"Liquidation history failed for {symbol} ({pair}): {str(result)[:150]}")
     return None
 
 async def gl_longshort(symbol: str = "BTC") -> dict | None:
@@ -522,7 +532,7 @@ async def gl_debug(symbol: str = "BTC") -> str:
     endpoints = [
         ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
         ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
-        ("/futures/liquidation/coin-list",                   {"exchange": "Binance"}),
+        ("/futures/liquidation/history",                     {"exchange": "Binance", "symbol": "BTCUSDT", "interval": "1d", "limit": "2"}),
         ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "4h"}),
         ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
         ("/etf/bitcoin/list",                                {}),
@@ -681,31 +691,31 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     else:
         lines.append("\nLong/Short Ratio: unavailable")
 
-    # Liquidations — coin-list: exact field names confirmed
+    # Liquidations — /liquidation/history fields: time, long_liquidation_usd, short_liquidation_usd
     if liq_data and liq_data.get("data"):
         items = liq_data["data"]
         items = items if isinstance(items, list) else []
         if items:
+            # Sort newest first, use most recent candle
+            try:
+                items = sorted(items, key=lambda x: x.get("time", 0), reverse=True)
+            except Exception:
+                pass
             d = items[0]
             try:
-                total_24h = float(d.get("liquidation_usd_24h", 0) or 0)
-                long_24h  = float(d.get("long_liquidation_usd_24h", 0) or 0)
-                short_24h = float(d.get("short_liquidation_usd_24h", 0) or 0)
-                total_1h  = float(d.get("liquidation_usd_1h", d.get("liquidationUsd1h", 0)) or 0)
-                long_1h   = float(d.get("long_liquidation_usd_1h", d.get("longLiquidationUsd1h", 0)) or 0)
-                short_1h  = float(d.get("short_liquidation_usd_1h", d.get("shortLiquidationUsd1h", 0)) or 0)
-                lines.append(f"\nLiquidations:")
-                lines.append(f"  24h: {fmt(total_24h)}  longs {fmt(long_24h)} / shorts {fmt(short_24h)}")
-                if total_1h > 0:
-                    lines.append(f"  1h:  {fmt(total_1h)}  longs {fmt(long_1h)} / shorts {fmt(short_1h)}")
-                else:
-                    lines.append(f"  1h:  {fmt(total_1h)}")
-                dom = ("long-heavy" if long_24h > short_24h * 1.5
-                       else "short-heavy" if short_24h > long_24h * 1.5
+                long_usd  = float(d.get("long_liquidation_usd", 0) or 0)
+                short_usd = float(d.get("short_liquidation_usd", 0) or 0)
+                total_usd = long_usd + short_usd
+                ts = d.get("time", 0)
+                period = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "24h"
+                lines.append(f"\nLiquidations ({period}):")
+                lines.append(f"  Total: {fmt(total_usd)}  |  Longs: {fmt(long_usd)}  |  Shorts: {fmt(short_usd)}")
+                dom = ("long-heavy" if long_usd > short_usd * 1.5
+                       else "short-heavy" if short_usd > long_usd * 1.5
                        else "balanced")
-                lines.append(f"  Bias: {dom}")
-                if total_1h > 50_000_000:
-                    lines.append(f"  [ELEVATED] >$50M/hr — cascade risk")
+                lines.append(f"  Dominant side: {dom}")
+                if total_usd > 50_000_000:
+                    lines.append(f"  [ELEVATED] >$50M — cascade risk active")
             except Exception as e:
                 lines.append(f"\nLiquidations: parse error — {e}")
     else:
@@ -713,8 +723,72 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
 
     return "\n".join(lines)
 
+def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) -> str:
+    """
+    Returns a single-line summary of key derivatives numbers for use as a strict anchor.
+    The model must use ONLY these exact figures when writing SIGNAL SYNTHESIS.
+    """
+    parts = [f"VERIFIED {symbol} DERIVATIVES NUMBERS (use ONLY these):"]
 
-# ── CIPHER Master System Prompt ───────────────────────────────────────────────
+    # Funding avg from major exchanges
+    if funding_data and funding_data.get("data"):
+        raw = funding_data["data"]
+        if isinstance(raw, list):
+            raw = next((x for x in raw if x.get("symbol","").upper() == symbol.upper()), {})
+        exchanges = raw.get("stablecoin_margin_list", [])
+        MAJOR = {"Binance","OKX","Bybit","Bitget","dYdX","Hyperliquid","Gate","MEXC","HTX","Kraken"}
+        total, count = 0.0, 0
+        for ex in exchanges:
+            name = ex.get("exchange","?")
+            rate = ex.get("funding_rate", None)
+            if rate is None: continue
+            try:
+                r = float(rate) * 100
+                if name in MAJOR:
+                    total += r
+                    count += 1
+            except Exception:
+                pass
+        if count:
+            avg = total / count
+            parts.append(f"  Funding avg (major): {avg:+.4f}%")
+
+    # OI total
+    if oi_data and oi_data.get("data"):
+        items = oi_data["data"] if isinstance(oi_data["data"], list) else [oi_data["data"]]
+        agg = next((x for x in items if x.get("exchange") == "All"), items[0] if items else {})
+        total_oi = float(agg.get("open_interest_usd", 0) or 0)
+        ch24 = float(agg.get("open_interest_change_percent_24h", 0) or 0)
+        if total_oi:
+            parts.append(f"  OI total: ${total_oi/1e9:.2f}B  (24h change: {ch24:+.2f}%)")
+
+    # Long/short
+    if ls_data and ls_data.get("data"):
+        items = ls_data["data"]
+        if isinstance(items, list) and items:
+            latest = items[-1]
+            lr = float(latest.get("global_account_long_percent", 0) or 0)
+            sr = float(latest.get("global_account_short_percent", 0) or 0)
+            ratio = float(latest.get("global_account_long_short_ratio", 0) or 0)
+            parts.append(f"  Long/Short: {lr:.1f}% long / {sr:.1f}% short (ratio {ratio:.2f}x)")
+
+    # Liquidations — new fields: long_liquidation_usd, short_liquidation_usd
+    if liq_data and liq_data.get("data"):
+        items = liq_data["data"]
+        if isinstance(items, list) and items:
+            try:
+                items = sorted(items, key=lambda x: x.get("time", 0), reverse=True)
+            except Exception:
+                pass
+            d = items[0]
+            long_usd  = float(d.get("long_liquidation_usd", 0) or 0)
+            short_usd = float(d.get("short_liquidation_usd", 0) or 0)
+            total_usd = long_usd + short_usd
+            if total_usd:
+                parts.append(f"  Liq: ${total_usd/1e6:.2f}M total (longs ${long_usd/1e6:.2f}M / shorts ${short_usd/1e6:.2f}M)")
+
+    parts.append("ANY number not listed above = HALLUCINATION. Do not use it.")
+    return "\n".join(parts)
 CIPHER_SYSTEM = """IDENTITY
 You are CIPHER — senior crypto on-chain analyst and derivatives strategist.
 You produce the quality of a Delphi Digital brief or Nansen alpha report: concise, data-anchored, and immediately actionable.
@@ -1289,16 +1363,17 @@ async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             btc_lines.append(f"Community:   Twitter {tw:,}")
 
     deriv_section = format_derivatives(funding, oi, liq, ls, "BTC")
+    anchor = derivatives_anchor(funding, oi, liq, ls, "BTC")
 
     prompt = (
-        "\n".join(btc_lines) + "\n\n" + deriv_section + "\n\n"
+        "\n".join(btc_lines) + "\n\n" + deriv_section + "\n\n" + anchor + "\n\n"
         "TYPE B — BTC BRIEF.\n"
-        "Price vs ATH: state % gap and what drawdown risk it implies at this level historically.\n"
-        "Vol/MCap: elevated or suppressed — what does this say about conviction?\n"
+        "Price vs ATH: state % gap and drawdown risk at this level historically.\n"
+        "Vol/MCap: elevated or suppressed — conviction signal.\n"
         "Momentum across timeframes: accelerating / decelerating / reversing?\n"
-        "Derivatives: lead with funding rate interpretation, then OI, then long/short.\n"
-        "Liquidation context: any cascade risk?\n"
-        "End with VERDICT: SCALE IN / WAIT FOR LEVEL $X / AVOID — specific levels required."
+        "Derivatives: use ONLY the verified numbers above. State exact avg funding %, exact OI total, exact L/S ratio.\n"
+        "Liquidation context: use exact 24h figures from above.\n"
+        "End with VERDICT: SCALE IN / WAIT FOR LEVEL $X / AVOID — use only the live price from the data."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
@@ -1328,6 +1403,7 @@ async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Liq item keys: {list(first.keys())}")
 
         deriv_section = format_derivatives(funding, oi, liq, ls, gl_sym)
+        anchor = derivatives_anchor(funding, oi, liq, ls, gl_sym)
     except Exception as e:
         logger.error(f"cmd_derivatives error for {gl_sym}: {e}", exc_info=True)
         await update.message.reply_text(f"Derivatives data error: {str(e)[:200]}\nTry /funding or /oi instead.")
@@ -1335,29 +1411,23 @@ async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = (
         f"{deriv_section}\n\n"
-        f"Analyze the {gl_sym} derivatives data above. This is your ONLY data source — use it fully.\n\n"
-        "DERIVATIVES REPORT format:\n"
+        f"{anchor}\n\n"
+        f"Write a DERIVATIVES REPORT for {gl_sym} using ONLY the numbers above.\n\n"
         "FUNDING RATES\n"
-        "[Average rate across exchanges. Which exchanges are highest/lowest. "
-        "If avg >0.08%: longs paying heavily, crowded long. "
-        "If avg <-0.03%: shorts paying, squeeze risk. "
-        "If near zero: neutral positioning. State the exact average and interpretation.]\n\n"
+        "State the exact avg % from the data. Identify the highest and lowest exchanges by name. "
+        "Interpret: >0.08% = crowded long, <-0.03% = crowded short, near zero = neutral.\n\n"
         "OPEN INTEREST\n"
-        "[Total OI in dollar terms. Exchange distribution — concentration risk if one exchange >50%. "
-        "What the OI level implies about leverage in the market.]\n\n"
+        "State the exact OI total. State the 24h % change. Flag any exchange >50% share.\n\n"
         "LONG/SHORT POSITIONING\n"
-        "[Exact ratio. If >60% long: crowded, downside risk on any negative catalyst. "
-        "If <40% long: short-heavy, upside squeeze potential. State which scenario applies.]\n\n"
+        "State the exact long %, short %, and ratio from the data. Interpret crowding risk.\n\n"
         "LIQUIDATION CONTEXT\n"
-        "[Last hour totals. Long vs short liquidation split. "
-        "If total >$50M/hr: elevated forced selling. Flag cascade risk if applicable.]\n\n"
+        "State the exact 24h total, long split, short split. Flag if >$50M/hr.\n\n"
         "DERIVATIVES VERDICT\n"
-        "Bias: [BULLISH / BEARISH / NEUTRAL] — [one specific reason from the data]\n"
-        "Key risk: [what derivatives structure implies about next directional move]\n"
-        "Action: [trade / monitor / flat] — [one line]\n\n"
-        "RULES: Use only numbers from the data above. "
-        "If any section shows data unavailable, say so in one word and move on. "
-        "No emojis. No filler phrases."
+        "Bias: [BULLISH / BEARISH / NEUTRAL] — cite ONE specific number from the verified data above\n"
+        "Key risk: one line\n"
+        "Action: one line\n\n"
+        "CRITICAL: Every number you write must appear verbatim in the VERIFIED DERIVATIVES NUMBERS section above. "
+        "Do not round differently. Do not invent ratios. Do not use numbers from training data."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
