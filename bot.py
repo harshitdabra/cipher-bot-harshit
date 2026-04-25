@@ -1,5 +1,5 @@
 """
-CIPHER Telegram Bot — Definitive Release
+Blockiva Telegram Bot
 Data: CoinGecko Pro + CoinGlass Pro + DeFiLlama + Alternative.me
 AI:   Groq Llama 3.3 70B
 
@@ -102,7 +102,7 @@ async def tier_gate(update: Update) -> bool:
         return True
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
-        "CIPHER Pro required ($10/month).\n\n"
+        "Blockiva Pro required ($10/month).\n\n"
         "Pro unlocks: /cipher  /btc  /derivatives  /defi  /dex\n"
         "             /yields  /etf  /dominance  /trending\n"
         "             /watchlist  /ask  + automatic alerts\n\n"
@@ -869,7 +869,7 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     parts.append("ANY number not listed above = HALLUCINATION. Do not use it.")
     return "\n".join(parts)
 CIPHER_SYSTEM = """IDENTITY
-You are CIPHER — senior digital assets analyst at a tier-1 institutional desk (BlackRock / Goldman Sachs / Fidelity caliber).
+You are BLOCKIVA — senior digital assets analyst at a tier-1 institutional desk (BlackRock / Goldman Sachs / Fidelity caliber).
 You write at the standard of a morning markets brief distributed to portfolio managers and CIOs before open.
 Every output must be immediately actionable: a PM reading your response should know exactly what to do with their book.
 
@@ -999,17 +999,17 @@ async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str
 
     try:
         resp = await asyncio.wait_for(loop.run_in_executor(None, _sync_call), timeout=50)
-        return resp.choices[0].message.content.strip() or "CIPHER: empty response."
+        return resp.choices[0].message.content.strip() or "Blockiva: empty response."
     except asyncio.TimeoutError:
-        return "CIPHER: Groq timeout (50s). Try again."
+        return "Blockiva: Groq timeout (50s). Try again."
     except Exception as e:
         logger.error(f"Groq error: {e}")
-        return f"CIPHER: AI error — {str(e)[:120]}"
+        return f"Blockiva: AI error — {str(e)[:120]}"
 
 # ── Send helper ───────────────────────────────────────────────────────────────
 async def send(update: Update, text: str):
     if not text.strip():
-        await update.message.reply_text("CIPHER: no output. Try again.")
+        await update.message.reply_text("Blockiva: no output. Try again.")
         return
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i+4000])
@@ -1256,7 +1256,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     prompt = (
         f"{full_context}\n\n"
         f"USER QUESTION: {text}\n\n"
-        "Classify this question (TYPE A/B/C/D/E/F/G) and respond with the correct CIPHER format.\n"
+        "Classify this question (TYPE A/B/C/D/E/F/G) and respond with the correct BLOCKIVA format.\n"
         "Use ONLY the live data above. Do not fabricate numbers not present in the data.\n"
         "If derivatives data is present, incorporate it as a primary signal."
     )
@@ -1301,7 +1301,7 @@ async def check_and_send_alerts(app) -> None:
                     direction = "SURGE" if ch1h > 0 else "FLUSH"
                     note = "monitor for continuation or reversal" if ch1h > 0 else "check derivatives for cascade risk"
                     alerts.append((key, (
-                        f"[CIPHER ALERT]  PRICE {direction}\n"
+                        f"[BLOCKIVA ALERT]  PRICE {direction}\n"
                         f"{sym}: {price_str(c['current_price'])}  {pct(ch1h)} 1h\n"
                         f"Action: {note}"
                     )))
@@ -1323,7 +1323,7 @@ async def check_and_send_alerts(app) -> None:
                 if _cooldown_ok(key):
                     bias = "OVERLEVERAGED LONG — long squeeze risk" if avg > 0 else "EXTREME SHORT BIAS — short squeeze building"
                     alerts.append((key, (
-                        f"[CIPHER ALERT]  FUNDING EXTREME\n"
+                        f"[BLOCKIVA ALERT]  FUNDING EXTREME\n"
                         f"BTC avg funding: {avg*100:.4f}%  {bias}\n"
                         f"Action: {'reduce leveraged longs, tighten stops' if avg > 0 else 'watch for short squeeze trigger above key resistance'}"
                     )))
@@ -1350,7 +1350,7 @@ async def check_and_send_alerts(app) -> None:
                     else:
                         note = "Exiting Extreme Greed: de-risking phase may begin. Review open positions."
                     alerts.append((key, (
-                        f"[CIPHER ALERT]  SENTIMENT SHIFT\n"
+                        f"[BLOCKIVA ALERT]  SENTIMENT SHIFT\n"
                         f"Fear & Greed: {val}/100 — {label}\n"
                         f"{note}"
                     )))
@@ -1399,7 +1399,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"DM {contact} to upgrade  |  /plans to see all features"
         )
     await update.message.reply_text(
-        f"*CIPHER Intelligence*  |  {plan}\n"
+        f"*Blockiva Intelligence*  |  {plan}\n"
         f"Welcome, {u.first_name}.\n\n"
         + body,
         parse_mode=ParseMode.MARKDOWN,
@@ -1411,7 +1411,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free_note = "" if plan in ("PRO", "OWNER") else "\n_* = Pro only ($10/month) — /upgrade_"
     p = "*" if plan not in ("PRO", "OWNER") else ""
     await update.message.reply_text(
-        f"*CIPHER — Institutional Market Intelligence*  |  {plan}\n"
+        f"*Blockiva — Institutional Market Intelligence*  |  {plan}\n"
         + free_note + "\n\n"
         "*Market Reports*\n"
         f"`/cipher`{p} — Full cycle: macro + market + derivatives + allocation signal\n"
@@ -1528,7 +1528,7 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n".join(defi_lines),
             deriv_section,
         ]) +
-        "\n\nTYPE A — Full CIPHER cycle report.\n"
+        "\n\nTYPE A — Full Blockiva cycle report.\n"
         "For every metric: state the number AND its implication in the same sentence.\n"
         "Derivatives are primary signals — lead with funding rate and OI interpretation.\n"
         "Stablecoin total supply direction and Vol/MCap — interpret explicitly.\n"
@@ -2321,9 +2321,9 @@ async def cmd_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     current = user.get("custom_instructions","").strip()
     await update.message.reply_text(
-        "*CIPHER — Custom Analyst Profile*\n\n"
+        "*Blockiva — Custom Analyst Profile*\n\n"
         f"Current: `{current or 'none set'}`\n\n"
-        "This context is injected into every CIPHER response. Be specific.\n\n"
+        "This context is injected into every Blockiva response. Be specific.\n\n"
         "Good examples:\n"
         "  Focus coins: BTC, ETH, SOL, LINK, TAO, SEI\n"
         "  Style: swing trading, 3-7 day holds\n"
@@ -2354,7 +2354,7 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = "OWNER" if uid == OWNER_ID else ("PRO" if is_pro(uid) else "FREE")
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
-        f"*CIPHER Plans*  |  Your current plan: {plan}\n\n"
+        f"*Blockiva Plans*  |  Your current plan: {plan}\n\n"
         "*FREE — No cost*\n"
         "  /fear — Fear & Greed + stablecoin supply\n"
         "  /macro — Macro regime + FOMC/CPI/NFP calendar\n"
@@ -2383,11 +2383,11 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid == OWNER_ID or is_pro(uid):
-        await update.message.reply_text("You already have CIPHER Pro. Thank you.")
+        await update.message.reply_text("You already have Blockiva Pro. Thank you.")
         return
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
-        "*Upgrade to CIPHER Pro — $10/month*\n\n"
+        "*Upgrade to Blockiva Pro — $10/month*\n\n"
         "Payment: Crypto (USDT / USDC — any chain)\n\n"
         f"DM {contact} with:\n"
         f"  1. Your Telegram user ID: `{uid}`\n"
@@ -2416,7 +2416,7 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = "ON" if user.get("alerts", True) else "OFF"
     await update.message.reply_text(
-        f"*CIPHER Automatic Alerts*  |  Status: {status}\n\n"
+        f"*Blockiva Automatic Alerts*  |  Status: {status}\n\n"
         "Active triggers:\n"
         "  BTC or ETH price moves >5% in 1 hour\n"
         "  BTC funding rate crosses extreme (>0.10% or <-0.05%)\n"
@@ -2556,7 +2556,7 @@ async def start_health_server():
     port = int(os.getenv("PORT", "8080"))
 
     async def health(_):
-        return web.Response(text="CIPHER OK")
+        return web.Response(text="Blockiva OK")
 
     srv = web.Application()
     srv.router.add_get("/", health)
@@ -2630,7 +2630,7 @@ async def main():
             BotCommand("setup",       "Custom analyst profile"),
             BotCommand("help",        "All commands + examples"),
         ])
-        logger.info("CIPHER — Online")
+        logger.info("Blockiva — Online")
         asyncio.create_task(start_health_server())
         asyncio.create_task(run_alert_poller(app))
         await app.start()
